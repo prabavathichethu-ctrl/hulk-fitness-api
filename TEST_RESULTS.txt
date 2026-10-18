@@ -1,0 +1,41 @@
+npm warn Unknown env config "http-proxy". This will stop working in the next major version of npm.
+
+> hulk-ai-backend@2.0.0 test
+> node --test
+
+✔ incomplete source metadata can remain a draft without inventing muscle choices or rest (3.075767ms)
+✔ extra source days/exercises and oversized names are rejected rather than dropped or shortened (0.600533ms)
+✔ source-wide rest is not substituted for an explicitly unknown individual rest (0.503998ms)
+✔ four-exercise transcription produces a canonical draft with twelve exact rows (6.498046ms)
+✔ missing KG/rest stay null; explicit zero is preserved and no dumbbell each-side inference occurs (2.471218ms)
+✔ missing/ranged reps, mismatched counts, excessive sets/rest and invalid muscles are never guessed or truncated (1.157041ms)
+✔ explicit shared numeric prescriptions expand faithfully; missing set count and a reps range require review (2.995907ms)
+✔ source tempo survives as a source note; explicit day positions retain order (0.948026ms)
+✔ series selection is explicit and never falls back to AI/default selection (0.755506ms)
+✔ AI parser accepts complete JSON/fences and rejects prose, truncation and multiple objects (0.409556ms)
+✔ stable import IDs are deterministic valid version-4 IDs (0.337037ms)
+✔ health is real HTTP and honestly reports missing setup (44.447327ms)
+✔ real Express CORS preflight allows the exact configured origin and blocks another origin (23.090318ms)
+✔ missing/invalid/anonymous tokens and non-owner access never call the AI or write (34.20892ms)
+✔ draft persistence uses only caller auth, validates the canonical model and ignores forged owner/status (14.241716ms)
+✔ preview creates no row; repeated identical imports return the same record without another AI call (16.780335ms)
+✔ same source in a different explicitly selected series is a separate draft (9.497087ms)
+✔ invalid series/input, object instead of Base64 and malformed images fail clearly before AI (18.10874ms)
+✔ invalid AI data returns needs_review with its original range and does not insert (4.736055ms)
+✔ JSON parse and byte limits return readable JSON plus request IDs (8.201489ms)
+✔ real sharp decodes images; configured inline limits reject unreadable-compression workarounds (491.665249ms)
+✔ HTTP image import reaches the extractor with a JPEG and supports multiple images (11.813523ms)
+✔ database write rejection and unexplained conflicts never report a saved program (9.844661ms)
+✔ missing NVIDIA config and per-owner quota fail before provider usage (8.643805ms)
+✔ concurrent owner imports are rejected rather than consuming provider credits twice (8.799359ms)
+✔ NVIDIA request uses exact configured model/endpoint and a bounded image/text contract (0.739393ms)
+✔ provider timeout, 202, quota, truncation and malformed JSON are visible and provider secrets never leak (15.997197ms)
+✔ text-only import tolerates an unset optional FlutterFlow image variable (12.965117ms)
+ℹ tests 28
+ℹ suites 0
+ℹ pass 28
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 1057.739316

@@ -1,0 +1,93 @@
+{
+  "version": "hulk-render-ai-fix-2.0.0",
+  "files": [
+    {
+      "path": ".env.example",
+      "sha256": "47e2fc7099a49903c8617ee0741307351a0047eb166daf735137c3aaa84ac19c"
+    },
+    {
+      "path": "AUDIT_RESULTS.json",
+      "sha256": "011c5ab6b77d75d04994bd4a4dfa967ab2776334c08042e512821e23f0a5a70d"
+    },
+    {
+      "path": "CHECK_RESULTS.json",
+      "sha256": "ea7c84e8f9f26f52f5a2bbfad466869324be70dcc9020db65b000b9d6d6d8e76"
+    },
+    {
+      "path": "FLUTTERFLOW_SETUP.md",
+      "sha256": "91705701543617619f8ff15d9f99aa4f7c42b7bdbb36ff7ef5500608aedb31c6"
+    },
+    {
+      "path": "README.md",
+      "sha256": "4e11268fda9cacc280d4276742e041b291355d1746408394d9d8cd25c415e631"
+    },
+    {
+      "path": "TEST_RESULTS.txt",
+      "sha256": "df844f73c948ab886072e82c25655484dd47ffafef471557256363ce8b10fa7e"
+    },
+    {
+      "path": "changes.diff",
+      "sha256": "6ec3f509c881044c12d7a14b03da82149f6227dc4a009fdc461aff5a1d789dbf"
+    },
+    {
+      "path": "package-lock.json",
+      "sha256": "dc00a0d716f4488c0af942460f692b0d81e79cdfe1cd425f5b39290947b95711"
+    },
+    {
+      "path": "package.json",
+      "sha256": "e28783cf1969410efb4410fdfccc68825ac8e0be482c20ddff351adf25a2b753"
+    },
+    {
+      "path": "server.js",
+      "sha256": "95495d9da92e89709cffa45af5a77d4b8423c31850bd5d03b0a921d6ea754a25"
+    },
+    {
+      "path": "studio/custom-exercises.mjs",
+      "sha256": "8d433b8b16082f11355a46906d516cdb83cda515d81a6371eb16a3d66967ec5a"
+    },
+    {
+      "path": "studio/exercise-catalog.mjs",
+      "sha256": "f987da0f217943761b355c4b2dcfb8b3954dac3f31e3714b4b275e3003e6e41e"
+    },
+    {
+      "path": "studio/food-catalog.mjs",
+      "sha256": "e2640fae6f9d96d68065d5870346e8e46f0bd1de439235435007efd1714cf374"
+    },
+    {
+      "path": "studio/nutrition.mjs",
+      "sha256": "cb81bc2494091cfcddc72b06be2228de82c1de9576a1fab25c0c3bc0f9f6450c"
+    },
+    {
+      "path": "studio/plan-engine.mjs",
+      "sha256": "0b95b1c29918d5885829bab9521294e6eaf2801fa1593ba6daa5cd8519f928ae"
+    },
+    {
+      "path": "studio/studio-program-engine.mjs",
+      "sha256": "32d25a4a2bc6142b7875d21f56bf74920ef8a8aef59065013376fe09f34345af"
+    },
+    {
+      "path": "test/canonical-fixture.json",
+      "sha256": "48193a6090c9901e4bede26a3b8c7df25d2523a367991b2f0cf113517f95c0ea"
+    },
+    {
+      "path": "test/database.sql",
+      "sha256": "8ddece015c970bf9dbb0cae2af15da04cab523ba72b38d6568e4b4d30b75390e"
+    },
+    {
+      "path": "test/final-cases.test.mjs",
+      "sha256": "c696a4fd694a4be3edb206d00f75f5405b3818a2745262960d5b86af3a12102d"
+    },
+    {
+      "path": "test/import.test.mjs",
+      "sha256": "ccfc99321cafa6b8d2cb342578f9043193a59bbacd80167f7a78d1317d0815e3"
+    },
+    {
+      "path": "tools/make-db-fixture.mjs",
+      "sha256": "7806eb84c7551082f860c0d548f48ac56bb1a9808868930d0cb325fb99ca8f2d"
+    },
+    {
+      "path": "workout.mjs",
+      "sha256": "3aeeab92e604b05db5ff170d8c86317bd8de347c0be76c0b893ec6c8add68a20"
+    }
+  ]
+}

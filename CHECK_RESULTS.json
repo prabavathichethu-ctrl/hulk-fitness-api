@@ -1,0 +1,32 @@
+{
+  "local_backend_tests": {
+    "passed": 28,
+    "failed": 0,
+    "skipped": 0,
+    "transport": "actual local Express HTTP and real sharp image decoding",
+    "external_services": "mocked NVIDIA/Supabase"
+  },
+  "real_database_checks": {
+    "passed": 9,
+    "synthetic_data": "all rolled back"
+  },
+  "npm_ci": "passed with pinned package-lock",
+  "dependency_audit": {
+    "info": 0,
+    "low": 0,
+    "moderate": 0,
+    "high": 0,
+    "critical": 0,
+    "total": 0
+  },
+  "live_render": "not deployed; URL/account access not supplied",
+  "live_nvidia": "not tested; configured credentials/model/endpoint not supplied",
+  "flutterflow_browser": "not tested; current binding/project access not supplied",
+  "production_changes": "none",
+  "known_limitations": [
+    "current Studio per-set rows require integer reps; range strings return needs_review without saving",
+    "app concurrency/rate caps are per process, not a distributed durable queue",
+    "model-specific asset/polling adapters not implemented; unsupported pending jobs do not save",
+    "legacy workouts RLS issue remains pending separate review"
+  ]
+}

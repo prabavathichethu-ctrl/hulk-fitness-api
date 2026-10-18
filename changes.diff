@@ -1,0 +1,662 @@
+--- before/server.js
++++ after/server.js
+@@ -1,312 +1,118 @@
+-// Hulk Fitness – Workout Studio AI extractor (deploy on Render)
+-// POST /extract-workout  →  image (base64) or text  →  NVIDIA vision  →  training_programs (draft)
+-//
+-// Why this version works where the old one failed:
+-//  1. cors() answers the browser's OPTIONS preflight (FlutterFlow web sends JSON + Authorization).
+-//  2. express.json limit raised from the 100kb default to 25mb (base64 photos are 1–10 MB).
+-//  3. The image is shrunk below NVIDIA's ~180,000-character inline base64 limit.
+-//  4. The row is saved here, as the logged-in owner (their Supabase JWT), so RLS passes,
+-//     created_by is set, and `content` matches the studio's hulk-studio-library-1.0.0 format.
+-
++// HULK Studio AI / Render. No production data changes occur on startup.
+ import express from 'express';
+ import cors from 'cors';
+ import sharp from 'sharp';
+-import { createClient } from '@supabase/supabase-js';
+-import { randomUUID } from 'node:crypto';
+-import { pathToFileURL } from 'node:url';
+-
+-const {
+-  SUPABASE_URL,                 // https://iufsxnlonwnylqerwafs.supabase.co
+-  SUPABASE_ANON_KEY,            // anon / publishable key (NOT the service-role key)
+-  NVIDIA_API_KEY,
+-  NVIDIA_MODEL = 'meta/llama-3.2-90b-vision-instruct', // set to the vision model you already use
+-  ALLOWED_ORIGINS = '*',        // e.g. https://hulkfitnessarena.in,https://app.flutterflow.io
+-  PORT = 10000,
+-} = process.env;
+-
+-// ---------- Studio vocabulary (edit to match your studio) ----------
+-
+-// One line per series so the AI can choose when the admin doesn't pick one.
+-// TODO: describe who each series is for, in your own words.
+-export const SERIES_GUIDE = {
+-  hulk_fit: 'HULK FIT – general gym programs (default)',
+-  alpha: 'ALPHA – describe this series here',
+-  aura: 'AURA – describe this series here',
+-  goat: 'GOAT – describe this series here',
+-};
+-
+-export const MUSCLES = [
+-  'chest', 'front_delts', 'side_delts', 'rear_delts', 'triceps', 'biceps', 'forearms',
+-  'lats', 'upper_back', 'traps', 'lower_back', 'abs', 'obliques',
+-  'glutes', 'quads', 'hamstrings', 'calves', 'adductors',
+-];
+-export const EQUIPMENT = ['gym', 'dumbbell', 'bodyweight'];
+-
+-const STUDIO_VERSION = 'hulk-studio-library-1.0.0';
+-const EXERCISE_VERSION = 'hulk-coach-exercise-1.0.0';
+-const NVIDIA_MAX_B64 = 175_000;
+-
+-// ---------- App ----------
+-
+-const app = express();
+-app.use(cors({
+-  origin: ALLOWED_ORIGINS === '*' ? true : ALLOWED_ORIGINS.split(',').map(s => s.trim()),
+-  methods: ['GET', 'POST', 'OPTIONS'],
+-  allowedHeaders: ['Content-Type', 'Authorization'],
+-}));
+-app.use(express.json({ limit: '25mb' }));
+-
+-const fail = (res, status, error) => res.status(status).json({ success: false, error });
+-
+-// Open this in a browser first: it also wakes Render's free instance (~50 s cold start).
+-app.get('/health', (_req, res) => res.json({ ok: true, model: NVIDIA_MODEL }));
+-
+-app.post('/extract-workout', async (req, res) => {
+-  const t0 = Date.now();
+-  try {
+-    const token = String(req.headers.authorization || '').replace(/^Bearer\s+/i, '').trim();
+-    if (!token) return fail(res, 401, 'Login token missing – pass Authorization: Bearer <JWT>');
+-
+-    // Act as the logged-in user so Supabase RLS decides what is allowed.
+-    const sb = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
+-      global: { headers: { Authorization: `Bearer ${token}` } },
+-      auth: { persistSession: false, autoRefreshToken: false },
+-    });
+-    const { data: userData, error: userErr } = await sb.auth.getUser(token);
+-    const user = userData?.user;
+-    if (userErr || !user) return fail(res, 401, 'Session expired – log in again');
+-
+-    // training_series is owner-only (RLS), so an empty list means "not the owner".
+-    // Checked before calling NVIDIA so nobody else can burn your API credits.
+-    const { data: seriesRows, error: sErr } = await sb.from('training_series').select('id, code, title');
+-    if (sErr) throw sErr;
+-    if (!seriesRows?.length) return fail(res, 403, 'Only the owner can use the AI workout studio');
+-
+-    // FlutterFlow sends an unset variable as "null" inside quotes – treat that as empty.
+-    const str = v => { const s = typeof v === 'string' ? v.trim() : ''; return s === 'null' || s === 'undefined' ? '' : s; };
+-    const body = req.body || {};
+-    const text = str(body.workoutText);
+-    const b64 = str(body.imageBase64);
+-    const seriesCode = str(body.seriesCode);
+-    const title = str(body.title);
+-    if (!b64 && !text) return fail(res, 400, 'Send imageBase64 or workoutText');
+-
+-    let jpeg = null;
+-    if (b64) {
+-      const raw = Buffer.from(b64.replace(/^data:[^;]+;base64,/, ''), 'base64');
+-      if (raw.length < 100) return fail(res, 400, 'imageBase64 is empty or not base64');
+-      jpeg = await shrinkForNvidia(raw);
+-    }
+-
+-    const ai = await askNvidia({ jpeg, text, codes: seriesRows.map(s => s.code) });
+-
+-    const code = pickSeries(seriesCode, ai.series, seriesRows.map(s => s.code));
+-    const series = seriesRows.find(s => s.code === code);
+-    const programTitle = cleanTitle(title || ai.title || ai.days?.[0]?.title);
+-    const content = buildContent(programTitle, ai);
+-    const exerciseCount = content.workout.sessions.reduce((n, s) => n + s.exercises.length, 0);
+-
+-    const { data: row, error: insErr } = await sb
+-      .from('training_programs')
+-      .insert({ series_id: series.id, title: programTitle, content, status: 'draft', created_by: user.id })
+-      .select('id, title')
+-      .single();
+-    if (insErr) throw insErr;
+-
+-    console.log(`saved ${row.id} (${code}, ${exerciseCount} exercises) in ${Date.now() - t0} ms`);
+-    res.json({
+-      success: true,
+-      message: `Saved "${row.title}" to ${series.title} as a draft (${exerciseCount} exercises)`,
+-      programId: row.id,
+-      series: code,
+-      title: row.title,
+-      exerciseCount,
+-    });
+-  } catch (e) {
+-    console.error('extract-workout failed:', e);
+-    fail(res, 500, e?.message || 'Server error');
+-  }
+-});
+-
+-// JSON parse errors / payload too large → JSON reply (CORS headers already set above).
+-app.use((err, _req, res, _next) => {
+-  const status = err.status || err.statusCode || 500;
+-  const msg = err.type === 'entity.too.large' ? 'Image too large (max 25 MB)' : err.message;
+-  fail(res, status, msg);
+-});
+-
+-// ---------- Helpers ----------
+-
+-// Shrink until the base64 fits NVIDIA's inline image limit. Grayscale keeps text sharp and small.
+-export async function shrinkForNvidia(buf) {
+-  for (const [w, q] of [[1280, 75], [1024, 70], [900, 62], [768, 55], [640, 50], [540, 45]]) {
+-    const out = await sharp(buf)
+-      .rotate()
+-      .resize(w, w * 2, { fit: 'inside', withoutEnlargement: true })
+-      .grayscale()
+-      .jpeg({ quality: q, mozjpeg: true })
+-      .toBuffer();
+-    if (out.toString('base64').length <= NVIDIA_MAX_B64) return out;
+-  }
+-  throw new Error('Image is too big even after compression – crop the screenshot and try again');
++import {randomUUID} from 'node:crypto';
++import {pathToFileURL} from 'node:url';
++import {ImportError,digest,parseAiJson,pickSeries,buildProgram,buildPrompt,stableId} from './workout.mjs';
++export {parseAiJson,pickSeries,buildProgram} from './workout.mjs';
++const defaults=['https://hulkfitnessarena.in','https://www.hulkfitnessarena.in','https://app.flutterflow.io'];
++const positive=(v,fallback,max)=>{if(v===undefined||v==='')return fallback;const n=Number(v);if(!Number.isInteger(n)||n<1||n>max)throw Error('Invalid positive configuration value');return n;};
++export function configFromEnv(env=process.env){
++ const origins=(env.ALLOWED_ORIGINS||defaults.join(',')).split(',').map(s=>s.trim()).filter(Boolean);
++ if(!origins.length||origins.some(s=>{try{return s==='*'||!/^https?:\/\//.test(s)||new URL(s).origin!==s;}catch{return true;}}))throw Error('ALLOWED_ORIGINS must contain exact HTTP(S) origins, never *.');
++ return {supabaseUrl:(env.SUPABASE_URL||'').replace(/\/$/,''),supabaseKey:env.SUPABASE_ANON_KEY||env.SUPABASE_PUBLISHABLE_KEY||'',nvidiaKey:env.NVIDIA_API_KEY||'',model:env.NVIDIA_MODEL||'',endpoint:env.NVIDIA_ENDPOINT||'https://integrate.api.nvidia.com/v1/chat/completions',origins,jsonLimit:positive(env.MAX_JSON_BYTES,16*1024*1024,20*1024*1024),maxImageBytes:positive(env.MAX_IMAGE_BYTES,5*1024*1024,10*1024*1024),maxImages:positive(env.MAX_IMAGES,4,10),inlineCap:env.NVIDIA_MAX_IMAGE_BASE64_CHARS?positive(env.NVIDIA_MAX_IMAGE_BASE64_CHARS,0,20*1024*1024):0,maxEdge:positive(env.IMAGE_MAX_EDGE,4096,8192),aiTimeout:positive(env.AI_TIMEOUT_MS,90000,120000),dailyLimit:positive(env.IMPORTS_PER_OWNER_PER_DAY,200,10000),minuteLimit:positive(env.IMPORTS_PER_OWNER_PER_MINUTE,6,60)};
+ }
+-
+-function buildPrompt(codes) {
+-  const guide = codes.map(c => `- ${c}: ${SERIES_GUIDE[c] || c}`).join('\n');
+-  return `You read gym workout routines from an image or text (screenshot, whiteboard photo, notebook, typed list).
+-Extract every exercise exactly as written. Do not invent exercises. Write exercise names in English.
+-
+-Pick the best series:
+-${guide}
+-
+-Return ONLY valid JSON (no markdown, no explanation) in this shape:
+-{"title":"Chest Beginners","series":"${codes[0]}","days":[{"title":"Chest Day","exercises":[
+- {"name":"Flat bench dumbbell press","sets":3,"reps":"12-16","equipment":"dumbbell",
+-  "primary":["chest"],"secondary":["front_delts","triceps"],"rest_seconds":60,
+-  "set_details":[{"kg":5,"reps":16},{"kg":5,"reps":14},{"kg":7.5,"reps":12}]}]}]}
+-
+-Rules:
+-- "series" must be one of: ${codes.join(', ')}
+-- "equipment" must be one of: ${EQUIPMENT.join(', ')} (barbell, machine, cable = gym)
+-- "primary" and "secondary" only from: ${MUSCLES.join(', ')}
+-- If weights per set are not shown, use "set_details": []
+-- If rest is not shown, use "rest_seconds": null
+-- One workout = one day. Several days (Day 1, Push, Pull…) = several days, max 7.`;
++const bad=(code,message,status=400,extra)=>{throw new ImportError(code,message,status,extra);};
++function base64Bytes(value,limit){
++ if(typeof value!=='string')bad('image_type','imageBase64 must be a Base64 String, not an Uploaded File object.');
++ const s=value.trim().replace(/^data:image\/(?:jpeg|png|webp);base64,/i,'');
++ if(!s||s.length%4!==0||!/^[A-Za-z0-9+/]+={0,2}$/.test(s))bad('image_base64','Invalid Base64 image.');
++ if(s.length>Math.ceil(limit/3)*4)bad('image_too_large','Image exceeds the configured decoded-byte limit.',413);
++ const b=Buffer.from(s,'base64');if(b.length<16||b.length>limit||b.toString('base64')!==s)bad('image_base64','Invalid Base64 image.');return b;
+ }
+-
+-export async function askNvidia({ jpeg, text, codes }) {
+-  if (!NVIDIA_API_KEY) throw new Error('NVIDIA_API_KEY is not set on Render');
+-  const content = [{ type: 'text', text: buildPrompt(codes) + (text ? `\n\nWORKOUT TEXT:\n${text}` : '') }];
+-  if (jpeg) content.push({ type: 'image_url', image_url: { url: `data:image/jpeg;base64,${jpeg.toString('base64')}` } });
+-
+-  const r = await fetch('https://integrate.api.nvidia.com/v1/chat/completions', {
+-    method: 'POST',
+-    headers: {
+-      Authorization: `Bearer ${NVIDIA_API_KEY}`,
+-      'Content-Type': 'application/json',
+-      Accept: 'application/json',
+-    },
+-    body: JSON.stringify({
+-      model: NVIDIA_MODEL,
+-      messages: [{ role: 'user', content }],
+-      max_tokens: 3000,
+-      temperature: 0.1,
+-      stream: false,
+-    }),
+-    signal: AbortSignal.timeout(120_000),
+-  });
+-  const body = await r.text();
+-  if (!r.ok) throw new Error(`NVIDIA ${r.status}: ${body.slice(0, 300)}`);
+-  const msg = JSON.parse(body).choices?.[0]?.message?.content;
+-  return parseAiJson(Array.isArray(msg) ? msg.map(p => p.text || '').join('') : String(msg || ''));
++export async function prepareImage(bytes,config){
++ try{
++  const img=sharp(bytes,{limitInputPixels:24000000,failOn:'error'}),m=await img.metadata();
++  if(!['jpeg','png','webp'].includes(m.format)||!m.width||!m.height||(m.pages||1)>1)bad('image_format','Use a single-frame JPG, PNG or WEBP image.');
++  const out=await img.rotate().resize(config.maxEdge,config.maxEdge,{fit:'inside',withoutEnlargement:true}).jpeg({quality:92,mozjpeg:true}).toBuffer();
++  const b64=out.toString('base64');if(config.inlineCap&&b64.length>config.inlineCap)bad('provider_image_limit','Image exceeds this model’s configured inline limit. Crop into readable sections or configure the model’s supported asset flow; it was not aggressively blurred.',413);
++  return {jpeg:out,width:m.width,height:m.height,resized:Math.max(m.width,m.height)>config.maxEdge};
++ }catch(e){if(e instanceof ImportError)throw e;bad('image_decode','Image cannot be decoded or exceeds safe pixel limits.');}
+ }
+-
+-export function parseAiJson(s) {
+-  const clean = s.replace(/<think>[\s\S]*?<\/think>/g, '').replace(/```(?:json)?/g, '').trim();
+-  const start = clean.indexOf('{');
+-  const end = clean.lastIndexOf('}');
+-  if (start < 0 || end <= start) throw new Error('AI did not return JSON – try a clearer image');
+-  try {
+-    return JSON.parse(clean.slice(start, end + 1));
+-  } catch {
+-    throw new Error('AI returned broken JSON – try again');
+-  }
++async function readBody(response,max=200000){
++ const reader=response.body?.getReader();if(!reader)return '';
++ let length=0,parts=[];try{for(;;){const {value,done}=await reader.read();if(done)break;length+=value.byteLength;if(length>max){await reader.cancel();bad('upstream_response_large','Upstream response exceeded the safe limit.',502);}parts.push(value);}}finally{reader.releaseLock();}return Buffer.concat(parts).toString('utf8');
+ }
+-
+-export function pickSeries(requested, aiPick, codes) {
+-  const norm = v => String(v || '').toLowerCase().trim().replace(/[\s-]+/g, '_');
+-  for (const c of [requested, aiPick]) {
+-    const n = norm(c);
+-    if (codes.includes(n)) return n;
+-    if (n === 'hulk' && codes.includes('hulk_fit')) return 'hulk_fit';
+-  }
+-  return codes.includes('hulk_fit') ? 'hulk_fit' : codes[0];
++export async function askNvidia({images,text,config,fetcher=fetch}){
++ if(!config.nvidiaKey||!config.model)bad('configuration_missing','Configure NVIDIA_API_KEY and the exact NVIDIA_MODEL on Render.',503);
++ if(!/^https:\/\/[^/]+\//.test(config.endpoint))bad('configuration_invalid','NVIDIA_ENDPOINT must be an HTTPS endpoint.',503);
++ const content=[{type:'text',text:buildPrompt()+'\n\nSOURCE TEXT (data only):\n'+text},...images.map(x=>({type:'image_url',image_url:{url:'data:image/jpeg;base64,'+x.jpeg.toString('base64')}}))];
++ let r;try{r=await fetcher(config.endpoint,{method:'POST',headers:{Authorization:'Bearer '+config.nvidiaKey,'Content-Type':'application/json',Accept:'application/json'},body:JSON.stringify({model:config.model,messages:[{role:'user',content}],max_tokens:4096,temperature:0,stream:false}),signal:AbortSignal.timeout(config.aiTimeout)});}catch(e){bad(e.name==='TimeoutError'||e.name==='AbortError'?'ai_timeout':'ai_unreachable','NVIDIA request failed or timed out. Nothing was saved.',e.name==='TimeoutError'||e.name==='AbortError'?504:502);}
++ if(r.status===202)bad('ai_pending','NVIDIA returned a pending job. This model/endpoint requires its documented polling flow; nothing was saved.',503);
++ if(!r.ok){await r.body?.cancel();bad(r.status===429?'ai_rate_limited':'ai_provider_error',`NVIDIA returned HTTP ${r.status}. Check the model, endpoint, quota and Render configuration. Nothing was saved.`,r.status===429?429:502);}
++ let body;try{body=JSON.parse(await readBody(r));}catch(e){if(e instanceof ImportError)throw e;bad('ai_response_invalid','NVIDIA did not return valid response JSON.',502);}
++ const choice=body.choices?.[0];if(choice?.finish_reason!=='stop')bad('ai_incomplete','NVIDIA output was incomplete, refused or truncated. Nothing was saved.',502);
++ const raw=choice.message?.content;return parseAiJson(Array.isArray(raw)?raw.map(p=>p.text||'').join(''):raw);
+ }
+-
+-export function cleanTitle(t) {
+-  const s = String(t || '').replace(/\s+/g, ' ').trim().slice(0, 140);
+-  return s.length >= 2 ? s : 'AI Imported Workout';
++export function createApp({config=configFromEnv(),fetcher=fetch,logger=console,now=Date.now,extract=askNvidia}={}){
++ const app=express(),usage=new Map(),inflight=new Map();app.disable('x-powered-by');
++ const missing=()=>['supabaseUrl','supabaseKey','nvidiaKey','model'].filter(k=>!config[k]);
++ const replyError=(res,e,requestId)=>res.status(e instanceof ImportError?e.status:500).json({success:false,error:e instanceof ImportError?e.message:'Unexpected backend error. Check Render logs using the request ID.',code:e instanceof ImportError?e.code:'internal_error',requestId,...(e instanceof ImportError?e.extra:{})});
++ app.use((req,res,next)=>{req.requestId=randomUUID();res.set('X-Request-ID',req.requestId);res.set('Cache-Control','no-store');next();});
++ app.use((req,res,next)=>{const origin=req.headers.origin;if(origin&&!config.origins.includes(origin))return replyError(res,new ImportError('origin_blocked','This browser origin is not allowed. Add its exact origin to ALLOWED_ORIGINS.',403),req.requestId);next();});
++ app.use(cors({origin:(origin,done)=>done(null,!origin||config.origins.includes(origin)),methods:['GET','POST','OPTIONS'],allowedHeaders:['Content-Type','Authorization','X-Request-ID'],exposedHeaders:['X-Request-ID'],maxAge:600}));
++ app.get('/health',(_req,res)=>res.json({ok:true,version:'2.0.0',configured:missing().length===0,message:'Process is running. This does not verify NVIDIA or database connectivity.'}));
++ async function db(path,token,{method='GET',body,write=false}={}){
++  let r;try{r=await fetcher(config.supabaseUrl+'/rest/v1/'+path,{method,headers:{apikey:config.supabaseKey,Authorization:'Bearer '+token,'Content-Type':'application/json',...(write?{Prefer:'return=representation'}:{})},...(body===undefined?{}:{body:JSON.stringify(body)}),signal:AbortSignal.timeout(15000)});}catch{bad('database_unreachable','Database request timed out or failed. A write may have completed; retry the identical input to check the same record.',503);}
++  let data;try{data=JSON.parse(await readBody(r,250000));}catch{bad('database_response','Database returned an unreadable response.',502);}
++  if(!r.ok){if(write&&r.status===409&&data.code==='23505')return {conflict:true};bad(r.status===401?'login_required':r.status===403?'owner_required':'database_error',r.status===401?'Log in again.':r.status===403?'Owner access is required.':'Database rejected the request; no success was reported.',r.status===401?401:r.status===403?403:422,{databaseCode:data?.code||null});}return data;
++ }
++ async function authenticate(req,res,next){
++  try{
++   if(!config.supabaseUrl||!config.supabaseKey)bad('configuration_missing','Configure SUPABASE_URL and SUPABASE_ANON_KEY on Render.',503);
++   const match=/^Bearer\s+(\S+)$/i.exec(req.headers.authorization||'');if(!match)bad('login_required','Pass the current Supabase user JWT in Authorization: Bearer <JWT>.',401);const token=match[1];
++   let r;try{r=await fetcher(config.supabaseUrl+'/auth/v1/user',{headers:{apikey:config.supabaseKey,Authorization:'Bearer '+token},signal:AbortSignal.timeout(15000)});}catch{bad('auth_unreachable','Login verification is unavailable. Retry shortly.',503);}
++   if(!r.ok)bad('login_required','Session expired or invalid. Log in again.',401);
++   let user;try{user=JSON.parse(await readBody(r,50000));}catch{bad('login_required','Invalid login verification response.',401);}
++   if(!/^[a-f0-9-]{36}$/i.test(user.id||'')||user.is_anonymous)bad('login_required','Use a signed-in owner account.',401);
++   const role=await db('rpc/my_role',token,{method:'POST',body:{}});if(role!=='owner')bad('owner_required','Only the active owner may import workouts.',403);
++   req.actor={id:user.id,token};next();
++  }catch(e){replyError(res,e,req.requestId);}
++ }
++ app.post('/extract-workout',authenticate,express.json({limit:config.jsonLimit,strict:true}),async(req,res)=>{
++  const stage=name=>{logger.info?.(JSON.stringify({requestId:req.requestId,stage:name}));};
++  let leased=false;
++  try{
++   stage('backend_received');if(!req.is('application/json'))bad('content_type','Send Content-Type: application/json.',415);
++   const body=req.body;if(!body||Array.isArray(body))bad('request_invalid','Send one JSON object.');
++   const clean=(v,key,max)=>{if(v===undefined||v===null||v==='null'||v==='undefined')return '';if(typeof v!=='string'||v.length>max)bad('request_invalid',key+' must be a String within the documented limit.');return v.trim();};
++   const text=clean(body.workoutText,'workoutText',20000),title=clean(body.title,'title',140),code=clean(body.seriesCode,'seriesCode',30),action=body.action||'import';
++   if(!['import','preview'].includes(action))bad('action_invalid','Supported actions: import (draft only) or preview (no save).');
++   const {id:userId,token}=req.actor;
++   const seriesRows=await db('training_series?select=id,code,title,status,revision&order=sort_order',token),series=pickSeries(code,seriesRows);
++   const inputs=[];if(body.imageBase64!==undefined&&body.imageBase64!==null&&!(typeof body.imageBase64==='string'&&['','null','undefined'].includes(body.imageBase64.trim())))inputs.push(body.imageBase64);
++   if(body.images!==undefined){if(!Array.isArray(body.images))bad('image_type','images must be an array of Base64 Strings.');inputs.push(...body.images);}
++   if(!text&&!inputs.length)bad('input_missing','Upload an image or paste workout text.');if(inputs.length>config.maxImages)bad('image_count',`Maximum ${config.maxImages} images per request.`,413);
++   const raw=inputs.map(v=>base64Bytes(v,config.maxImageBytes));if(raw.reduce((n,b)=>n+b.length,0)>10*1024*1024)bad('image_too_large','Combined decoded image size exceeds 10 MB.',413);
++   const fingerprint=digest({series:series.id,title,text,images:raw.map(b=>digest(b))});
++   const programId=stableId(`${userId}:${series.id}:${fingerprint}`);
++   const existing=async()=>{const rows=await db('training_programs?select=id,title,status,series_id,content&id=eq.'+programId,token);return rows?.[0];};
++   const resultFor=(row,duplicate=false)=>({success:true,message:duplicate?'This import already exists; the existing record was not changed.':`Saved "${row.title}" to ${series.title} as a draft.`,programId:row.id,series:series.code,title:row.title,status:row.status,exerciseCount:row.content.workout.sessions.reduce((n,s)=>n+(s.exercises?.length||0),0),duplicate,requestId:req.requestId});
++   if(action==='import'){const prior=await existing();if(prior){if(prior.series_id!==series.id)bad('import_conflict','Import identifier conflicts with another series.',409);return res.json(resultFor(prior,true));}}
++   if(inflight.has(userId))bad('import_busy','Another import is running for this owner. Wait for its result.',409);inflight.set(userId,req.requestId);leased=true;
++   if(missing().length)bad('configuration_missing','Configure NVIDIA_API_KEY and NVIDIA_MODEL before importing.',503);
++   const date=Math.floor(now()/86400000),minute=Math.floor(now()/60000),previous=usage.get(userId)||{},dayCount=previous.day===date?previous.dayCount:0,minuteCount=previous.minute===minute?previous.minuteCount:0;
++   if(dayCount>=config.dailyLimit||minuteCount>=config.minuteLimit)bad('import_rate_limited','Owner import limit reached. Wait before retrying.',429);
++   usage.set(userId,{day:date,minute,dayCount:dayCount+1,minuteCount:minuteCount+1});
++   const images=[];for(const b of raw)images.push(await prepareImage(b,config));stage('input_validated');
++   const ai=await extract({images,text,config,fetcher});stage('ai_extracted');
++   let built;try{built=buildProgram(ai,{series,userId,fingerprint,title,id:programId});}catch(e){if(e instanceof ImportError){e.extra={...(e.extra||{}),review:ai};}throw e;}
++   stage('studio_validated');const warnings=built.warnings;
++   if(images.some(x=>x.resized))warnings.push('A large image was resized; verify small text against the source.');
++   if(action==='preview')return res.json({success:true,message:'Preview ready. Nothing has been saved.',program:built.program,exerciseCount:built.exerciseCount,warnings,requestId:req.requestId});
++   // The reviewed canonical shape is validated first. A deterministic primary key makes creation atomic and retry-safe.
++   // All REST calls use the caller JWT and public key, so existing owner RLS still applies. No upsert/update/delete.
++   const saved=await db('training_programs?select=id,title,status,series_id,content',token,{method:'POST',body:built.program,write:true});
++   let row=saved?.[0],duplicate=false;if(saved.conflict){row=await existing();duplicate=true;}
++   if(!row||row.id!==programId||row.series_id!==series.id)bad('save_unconfirmed','Save result could not be confirmed. Retry identical input before creating a different import.',503);
++   stage('draft_saved');res.status(duplicate?200:201).json({...resultFor(row,duplicate),warnings});
++  }catch(e){logger.error?.(JSON.stringify({requestId:req.requestId,code:e instanceof ImportError?e.code:'internal_error'}));replyError(res,e,req.requestId);}
++  finally{if(leased&&inflight.get(req.actor.id)===req.requestId)inflight.delete(req.actor.id);}
++ });
++ app.use((err,req,res,_next)=>replyError(res,err.type==='entity.too.large'?new ImportError('payload_too_large','JSON body exceeds the configured byte limit.',413):err.type==='entity.parse.failed'?new ImportError('invalid_json','Request body is not valid JSON.',400):err,req.requestId));
++ return app;
+ }
+-
+-const toInt = (v, min, max) => {
+-  const n = Math.round(Number(String(v ?? '').match(/-?\d+(\.\d+)?/)?.[0]));
+-  return Number.isFinite(n) ? Math.min(max, Math.max(min, n)) : null;
+-};
+-const toKg = v => {
+-  const n = Number(String(v ?? '').replace(',', '.').match(/\d+(\.\d+)?/)?.[0]);
+-  return Number.isFinite(n) && n >= 0 && n <= 500 ? n : null;
+-};
+-const muscles = arr => [...new Set((Array.isArray(arr) ? arr : []).map(m => String(m).toLowerCase().trim()))]
+-  .filter(m => MUSCLES.includes(m));
+-
+-export function toExercise(ex) {
+-  const name = String(ex?.name || '').trim();
+-  if (!name) return null;
+-  const rest = toInt(ex.rest_seconds, 0, 600);
+-  const reps = String(ex.reps ?? '').trim().replace(/\s*-\s*|\s+to\s+/gi, '–') || '10–12';
+-  const given = Array.isArray(ex.set_details) ? ex.set_details.slice(0, 10) : [];
+-  const sets = given.length || toInt(ex.sets, 1, 10) || 3;
+-  const set_details = given.length
+-    ? given.map(s => ({ kg: toKg(s?.kg), reps: toInt(s?.reps, 1, 100), rest_seconds: toInt(s?.rest_seconds, 0, 600) ?? rest }))
+-    : Array.from({ length: sets }, () => ({ kg: null, reps: toInt(reps, 1, 100), rest_seconds: rest }));
+-  const eq = String(ex.equipment || '').toLowerCase();
+-  const equipment = EQUIPMENT.includes(eq) ? eq : 'gym';
+-
+-  return {
+-    id: `custom_${randomUUID()}`,
+-    reps,
+-    sets,
+-    custom: {
+-      en: name.slice(0, 120),
+-      kn: '',
+-      cues: { en: [], kn: [] },
+-      muscles: { primary: muscles(ex.primary), secondary: muscles(ex.secondary), stabilisers: [] },
+-      version: EXERCISE_VERSION,
+-      equipment,
+-    },
+-    set_details,
+-    rest_seconds: null,
+-    load_each_side: equipment === 'dumbbell',
+-    reps_in_reserve: null,
+-  };
+-}
+-
+-const emptyMenu = id => ({
+-  id,
+-  meals: [
+-    { slot: 'breakfast', title: 'Meal 1', ingredients: [] },
+-    { slot: 'lunch', title: 'Meal 2', ingredients: [] },
+-    { slot: 'snack', title: 'Meal 3', ingredients: [] },
+-    { slot: 'dinner', title: 'Meal 4', ingredients: [] },
+-  ],
+-});
+-
+-// Same shape as the programs your studio already saves (version hulk-studio-library-1.0.0).
+-export function buildContent(programTitle, ai) {
+-  const days = (Array.isArray(ai?.days) ? ai.days : [])
+-    .map(d => ({ title: d?.title, exercises: (Array.isArray(d?.exercises) ? d.exercises : []).map(toExercise).filter(Boolean) }))
+-    .filter(d => d.exercises.length)
+-    .slice(0, 7);
+-  if (!days.length) throw new Error('No exercises found – try a clearer image or paste the text');
+-
+-  const sessions = Array.from({ length: 7 }, (_, i) => days[i]
+-    ? { day: i, kind: 'strength', title: cleanTitle(days[i].title || programTitle), exercises: days[i].exercises }
+-    : { day: i, kind: 'rest', title: '', exercises: [] });
+-
+-  return {
+-    diet: { mode: 'personalized', note: '', menus: [emptyMenu('A'), emptyMenu('B')] },
+-    version: STUDIO_VERSION,
+-    workout: { mode: 'custom', note: '', sessions },
+-  };
+-}
+-
+-// ---------- Start ----------
+-
+-if (import.meta.url === pathToFileURL(process.argv[1] || '').href) {
+-  for (const k of ['SUPABASE_URL', 'SUPABASE_ANON_KEY', 'NVIDIA_API_KEY']) {
+-    if (!process.env[k]) console.warn(`⚠️  ${k} is not set`);
+-  }
+-  app.listen(PORT, () => console.log(`Hulk AI backend on :${PORT}`));
+-}
+-
++const app=createApp();
++if(import.meta.url===pathToFileURL(process.argv[1]||'').href){const port=Number(process.env.PORT||10000);app.listen(port,'0.0.0.0',()=>console.log('HULK Studio AI listening on port '+port));}
+ export default app;
+--- before/package.json
++++ after/package.json
+@@ -1,19 +1,19 @@
+ {
+   "name": "hulk-ai-backend",
+-  "version": "1.0.0",
++  "version": "2.0.0",
+   "private": true,
+   "type": "module",
+   "main": "server.js",
+   "scripts": {
+-    "start": "node server.js"
++    "start": "node server.js",
++    "test": "node --test"
+   },
+   "engines": {
+-    "node": ">=20"
++    "node": ">=22 <25"
+   },
+   "dependencies": {
+-    "@supabase/supabase-js": "^2.45.0",
+-    "cors": "^2.8.5",
+-    "express": "^4.21.0",
+-    "sharp": "^0.33.5"
++    "cors": "2.8.6",
++    "express": "4.22.3",
++    "sharp": "0.35.5"
+   }
+ }
+--- before/README.md
++++ after/README.md
+@@ -1,114 +1,119 @@
+-# Hulk Fitness – AI Workout Import: fix guide
++# HULK Studio AI — Render backend repair v2
+ 
+-Screenshot / text → Render backend → NVIDIA vision → saved as a **draft** in `training_programs`
+-(HULK FIT / ALPHA / AURA / GOAT), in the same format your Workout Studio already uses.
++Continue the existing **FlutterFlow → Render → NVIDIA → Supabase** integration. No provider migration. This package fixes the uploaded backend; it does not claim that your FlutterFlow button or live Render service has already been repaired.
+ 
+----
++## Current verification
+ 
+-## What was actually wrong
++- Actual local Express HTTP tests cover auth boundaries, browser preflight headers, JSON/byte limits, real Sharp image decoding, safe AI parsing, exact set transcription, selected series, retry deduplication and draft saving.
++- NVIDIA and Supabase network requests are mocked in the HTTP tests. This is NOT a live provider test.
++- Nine additional real Postgres checks ran with synthetic users/drafts in a transaction and were rolled back. They verify the canonical content format, owner RLS, exact null/zero retention, primary-key duplicate protection, forged-owner rejection and non-owner/anon denial. Production member/program records were not changed.
++- `npm ci` and `npm test` were run; test output and dependency audit are included.
++- Actual NVIDIA extraction, Render deployment and FlutterFlow browser/button tests remain pending: the Render URL, exact NVIDIA model/endpoint and account access were not supplied. No secret values were requested or stored.
+ 
+-| # | Problem | Fix |
+-|---|---------|-----|
+-| 1 | API body sent `<UploadedFile>` (the file object), not the base64 **String** | API variable `imageBase64` = **String**, filled by `convertFileToBase64(...)` |
+-| 2 | Custom Function listed as "Step 1" – custom functions are not action steps | Use it *inside* the API call's variable value |
+-| 3 | Express default JSON limit is 100 kb → base64 image rejected (413) | `express.json({ limit: '25mb' })` |
+-| 4 | No CORS on backend → browser blocks the request in web/test mode | `cors()` answers the OPTIONS preflight |
+-| 5 | NVIDIA inline images must be under ~180,000 base64 characters | Backend shrinks the image (tested: 1080×2400 screenshot → 163 KB) |
+-| 6 | FlutterFlow **Insert Row** would fail even if the API worked: RLS needs `created_by = your user id` + owner role, and `content.version` must be `hulk-studio-library-1.0.0` | Backend saves the row as you (your login token) in the exact studio format |
+-| 7 | "Response & Test" tab goes through FlutterFlow's Heroku proxy – big base64 always fails there | Not the real bug. Test from Test Mode / `/health` instead |
++## What was confirmed wrong in the uploaded code
+ 
+-Your `convertFileToBase64` function itself is fine.
++1. Missing set count/reps were replaced with guessed 3 and 10–12 defaults. Shared ranges could be reduced to the first number.
++2. Set values were rounded, clamped or silently truncated beyond limits that differed from the real Studio validator.
++3. “Each side” was inferred from dumbbell equipment instead of the source checkbox.
++4. Unspecified per-set rest could be overwritten by a general rest value.
++5. Muscle vocabulary included unsupported IDs; resistance-band equipment was missing.
++6. Invalid/missing selected series silently fell back to AI selection or HULK FIT.
++7. Inserts did not run the actual current Studio validator, and retries could create duplicate rows.
++8. Incomplete AI output, permissive Base64 decoding and unconditional aggressive image shrinking could damage input/output without a clear failure.
++9. The README claimed FlutterFlow mapping errors and live success without the actual bindings/live tests. Those frontend diagnoses remain unverified.
+ 
+----
++The replacement uses the six shared modules retrieved from the live fitness-library v4 backend. Do not edit these copied modules to bypass validation. All calls to Supabase use the public key and verified caller JWT; no service-role key is needed.
+ 
+-## 1. Render (backend)
++## Deploy to the EXISTING Render service
+ 
+-1. Replace your backend code with `server.js` + `package.json` from this folder.
+-2. Render settings → **Build command:** `npm install`  **Start command:** `npm start`
+-3. Render → Environment → add:
++Back up the current repository/deployment first. Replace the backend with **all** runtime files, not only server.js and package.json:
+ 
+-   | Key | Value |
+-   |-----|-------|
+-   | `SUPABASE_URL` | `https://iufsxnlonwnylqerwafs.supabase.co` |
+-   | `SUPABASE_ANON_KEY` | same anon/publishable key FlutterFlow uses (**not** service-role) |
+-   | `NVIDIA_API_KEY` | your NVIDIA key |
+-   | `NVIDIA_MODEL` | the vision model you already use on build.nvidia.com |
+-   | `ALLOWED_ORIGINS` | optional – leave empty to allow all |
++- server.js
++- workout.mjs
++- package.json + package-lock.json
++- the complete studio/ directory (six modules)
+ 
+-4. Open `https://YOUR-APP.onrender.com/health` in the browser → must show `{"ok":true,...}`.
+-   (Free Render sleeps; first call takes ~50 s. Open `/health` before testing.)
+-5. In `server.js`, edit `SERIES_GUIDE` – one line describing who each series is for, so the AI
+-   picks the right one when you don't choose.
++Use Node 22 or 24, Build command `npm ci`, Start command `npm start`. PORT is read from Render. Do not include node_modules or a real .env in Git.
+ 
+----
++Set the following server-side environment variables:
+ 
+-## 2. FlutterFlow – API call "Extract Workout API"
++| Variable | Value |
++|---|---|
++| SUPABASE_URL | https://iufsxnlonwnylqerwafs.supabase.co |
++| SUPABASE_ANON_KEY | The project public anon/publishable key; NOT service-role |
++| NVIDIA_API_KEY | Your NVIDIA API credential, entered only in Render |
++| NVIDIA_MODEL | Exact model identifier from your already-selected NVIDIA model |
++| NVIDIA_ENDPOINT | Exact documented inference endpoint for that model; defaults to https://integrate.api.nvidia.com/v1/chat/completions |
++| ALLOWED_ORIGINS | Comma-separated exact origins of your website and actual FlutterFlow Test/Run app |
+ 
+-- **Method:** POST  **URL:** `https://YOUR-APP.onrender.com/extract-workout`
+-- **Headers:**
+-  ```
+-  Authorization: Bearer [authToken]
+-  Content-Type: application/json
+-  ```
+-- **Variables** (all **String**): `authToken`, `imageBase64`, `workoutText`, `seriesCode`
+-- **Body → JSON:**
+-  ```json
+-  {
+-    "imageBase64": "<imageBase64>",
+-    "workoutText": "<workoutText>",
+-    "seriesCode": "<seriesCode>"
+-  }
+-  ```
+-- **Advanced Settings:** *Make Private* **OFF**, proxy **OFF** (if the toggle is shown).
+-  Private routes the call through a Firebase Cloud Function instead of Render.
+-- **Response JSON paths:** `$.message`, `$.error`, `$.programId`
++A model-specific route can differ from the generic chat endpoint. For example, NVIDIA documents a specific `/v1/meta/llama-3.2-90b-vision-instruct` route for that model. Copy the model/endpoint pair from your model's official API example; do not choose a model merely because it was a placeholder in the old code.
+ 
+----
++Defaults for origins: https://hulkfitnessarena.in, https://www.hulkfitnessarena.in, https://app.flutterflow.io. Your running FlutterFlow app can have a different origin. Obtain it from the actual browser URL/Network Origin and add that exact value. `*` is rejected. CORS is not authentication; server token and active-owner checks remain mandatory.
+ 
+-## 3. FlutterFlow – "Extract & Save" action flow
++Open `/health`: `ok:true` verifies only the process. `configured:true` means the required variables exist; it does NOT prove NVIDIA or database connectivity. Prove those using an authenticated synthetic import and actual logs.
+ 
+-```
+-0. Snackbar: "Sending to AI…"                       ← debug marker, keep for now
+-1. Backend Call → Extract Workout API
+-     authToken   = Authenticated User › JWT Token
+-     imageBase64 = Custom Functions › convertFileToBase64(Widget State › uploaded image)
+-     workoutText = Text field value   (optional – paste text instead of a screenshot)
+-     seriesCode  = Dropdown value: hulk_fit / alpha / aura / goat   (empty = AI decides)
+-     Action Output Variable Name: extractResult
+-2. Conditional → extractResult › Succeeded
+-     TRUE  → Snackbar: JSON path $.message → clear widget state → refresh programs list
+-     FALSE → Snackbar: JSON path $.error
++Read FLUTTERFLOW_SETUP.md next.
++
++## API
++
++POST `/extract-workout`
++
++Headers: `Content-Type: application/json`, `Authorization: Bearer <current Supabase user access token>`.
++
++```json
++{
++  "workoutText": "Chest Beginners...",
++  "imageBase64": "",
++  "seriesCode": "hulk_fit",
++  "title": "",
++  "action": "import"
++}
+ ```
+ 
+-**Delete the old Supabase "Insert Row" action** – the backend saves the row now.
++- Supply text, imageBase64, or both. An optional `images` array of Base64 strings supports grouped screenshots when the selected NVIDIA model supports that count. Preserve screenshot order.
++- `seriesCode` is required: hulk_fit, alpha, aura or goat. AI cannot override the destination.
++- `action` defaults to import: save a valid **draft only**. `preview` returns the validated draft without saving. Publishing and real member assignment stay in the existing Studio.
++- Never send a file object or arbitrary external image URL. JPEG, PNG and WEBP single-frame inputs only. The server checks decoded size and pixel count.
++- Default JSON body limit 16 MiB, individual decoded image limit 5 MiB, combined decoded image limit 10 MiB, max 4 images. These are app caps, NOT NVIDIA guarantees. Configure stricter limits for your actual model. Optional NVIDIA_MAX_IMAGE_BASE64_CHARS enforces a documented endpoint-specific inline cap. There is no universal NVIDIA 180,000-character rule here.
++- Large images are resized only to the configured IMAGE_MAX_EDGE (default 4096). Inputs that exceed a configured provider cap are rejected with a clear message rather than repeatedly blurred. NVCF asset-upload/polling flows are not implemented; a model requiring them needs a separate verified adapter. NVIDIA 202 jobs return ai_pending and are never called saved.
+ 
+-Programs are saved as **draft**; open them in the Workout Studio, check, then publish.
++Success is HTTP 201 on creation or 200 on an identical import retry. It returns success, message, programId, series, title, status, exerciseCount, duplicate, warnings and requestId. Exact-input retry IDs are derived from verified owner, selected series, title, text and image bytes. Same exact input never upserts or overwrites a record. Editing the input/title or re-encoding an image can create a new import; this is not fuzzy duplicate detection.
+ 
+----
++Errors use a non-2xx status and `{success:false,error,code,requestId}`. A `needs_review` error also returns the extracted `review` object; nothing was saved. Do not label it a successful import merely because the AI responded.
+ 
+-## 4. If it still fails – debug in this order
++## Deliberate compatibility boundaries
+ 
+-1. "Sending to AI…" doesn't appear → the button's On Tap action isn't firing (button disabled,
+-   action on the wrong widget).
+-2. It appears but nothing after → browser DevTools:
+-   - **Console** tab: look for red errors.
+-   - **Network** tab, filter **All**, search `extract`, `herokuapp`, `cloudfunctions`.
+-     `herokuapp` / `cloudfunctions` = proxy or Private is still ON.
+-     A failed `OPTIONS` request = CORS (check `ALLOWED_ORIGINS`).
+-3. Snackbar shows an error → status tells you where:
+-   - **401** – not logged in, or `authToken` not mapped
+-   - **403** – the logged-in email is not the owner in the `staff` table
+-   - **413** – image above 25 MB
+-   - **500** – open Render › **Logs**; the message is also in the snackbar
++The existing live Studio supports exact per-set reps (integers 1–60), 1–6 sets per exercise, up to 12 exercises per session, 7 session slots, KG up to 1000 and rest 0–300 seconds or null. It does not currently support a rep range string inside a per-set row. The importer returns the original range in a needs_review response rather than silently converting it. Mixed/timed/other prescriptions require an explicit compatible Studio extension; do not invent numeric reps to make them save.
+ 
+----
++Each-side source true/false is preserved. If not supplied, the existing checkbox remains off with a warning; the backend does not infer true from dumbbells. Unknown muscles remain unselected in a draft, to be reviewed before publication. Equipment/muscle mapping is AI-assisted and requires coach review. Source tempo is retained as a labelled source note; new coaching advice is not generated.
+ 
+-## Security note (separate from this bug)
++Single-session imports use duration 1 day and the first existing slot if no weekday was stated. Explicit weekdays retain their positions; this is a template layout, not an invented training recommendation. No diet targets, meals, memberships or assigned plans are created/changed.
+ 
+-`public.workouts` has Row Level Security **OFF** – anyone with your anon key can read or edit it.
+-Fix (run only after adding policies, otherwise the app can't read it at all):
++## Diagnostics and limits
+ 
+-```sql
+-ALTER TABLE public.workouts ENABLE ROW LEVEL SECURITY;
+--- then add SELECT policy for members and INSERT/UPDATE for owner
+-```
++Safe Render log stages: backend_received, input_validated, ai_extracted, studio_validated, draft_saved, with a request ID. Never log keys, full JWTs or Base64.
++
++- 400: invalid binding/input/JSON or missing/invalid series.
++- 401: missing/expired/wrong-project Supabase access token.
++- 403: non-owner or disallowed browser origin.
++- 409: another import is running, destination changed or identifier conflict.
++- 413: byte/image/model-cap limit; inspect code, not only status.
++- 415: wrong Content-Type.
++- 422 needs_review/studio_validation/database_error: inspect error and original review data; no false success.
++- 429: app/provider rate cap.
++- 502: provider/incomplete/invalid response.
++- 503/504: configuration, connectivity, pending-provider flow or timeout. A timed-out DB write might already have committed; retry identical input before changing it.
++
++Per-owner limits default to 6 AI calls/minute and 200/day; counters and the one-inflight-owner lock are in-memory per Node process, so they reset on restart and are NOT a distributed billing cap. Keep one instance for this repair and configure provider billing limits; add a durable shared queue/rate limiter before multi-instance bulk rollout. No distributed thousand-job queue is claimed in this patch.
++
++## Separate existing security finding
++
++Read-only inspection confirmed the legacy `public.workouts` table had RLS disabled plus anon DML grants. This backend does not use or change that table. `training_programs`/`training_series` already have owner RLS and no anon table privileges. Existing legacy staff/member policies are present, but must be checked against actual app use before a production RLS change. Do not disable protections, drop policies or run broad schema scripts to fix this import. Security remediation of the legacy table remains pending; no production policy changes were made by this patch.
++
++## Primary documentation checked
++
++- FlutterFlow API variables/body/auth: https://docs.flutterflow.io/resources/backend-logic/rest-api/
++- FlutterFlow Custom Functions: https://docs.flutterflow.io/concepts/custom-code/custom-functions/
++- NVIDIA model-specific image endpoint example: https://docs.api.nvidia.com/nim/reference/meta-llama-3_2-90b-vision-instruct-infer
++- Express CORS behaviour: https://expressjs.com/en/resources/middleware/cors/
++- Supabase caller-auth context: https://supabase.com/docs/guides/functions/auth-legacy-jwt

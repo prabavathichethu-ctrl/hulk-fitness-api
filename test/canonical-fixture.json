@@ -1,0 +1,170 @@
+{
+  "id": "d21af0e9-026e-4e36-8a5d-cb5aaec04597",
+  "series_id": "669966f7-6563-4367-8fdc-1f8c034038b3",
+  "title": "Synthetic Render import",
+  "title_kn": "",
+  "description": "AI-imported draft. Review the source values, inferred muscle/equipment selections and coaching notes before publishing.",
+  "description_kn": "",
+  "duration_days": 1,
+  "goal": "any",
+  "experience": "any",
+  "equipment": "any",
+  "diet_pref": "any",
+  "status": "draft",
+  "sort_order": 0,
+  "created_by": "00000000-0000-4000-8000-000000000099",
+  "updated_by": "00000000-0000-4000-8000-000000000099",
+  "content": {
+    "version": "hulk-studio-library-1.0.0",
+    "workout": {
+      "mode": "custom",
+      "note": "AI import: numeric values were transcribed; equipment/muscle mapping requires coach review. This draft is not assigned to members.",
+      "sessions": [
+        {
+          "day": 0,
+          "kind": "strength",
+          "title": "Synthetic session",
+          "exercises": [
+            {
+              "id": "custom_550a7884-3746-492b-86b5-8783117491aa",
+              "custom": {
+                "version": "hulk-coach-exercise-1.0.0",
+                "en": "Synthetic press",
+                "kn": "",
+                "equipment": "dumbbell",
+                "cues": {
+                  "en": [],
+                  "kn": []
+                },
+                "muscles": {
+                  "primary": [
+                    "chest"
+                  ],
+                  "secondary": [
+                    "front_delts",
+                    "triceps"
+                  ],
+                  "stabilisers": []
+                }
+              },
+              "set_details": [
+                {
+                  "kg": 5,
+                  "reps": 16,
+                  "rest_seconds": null
+                },
+                {
+                  "kg": 5,
+                  "reps": 14,
+                  "rest_seconds": 0
+                },
+                {
+                  "kg": 7.5,
+                  "reps": 12,
+                  "rest_seconds": null
+                }
+              ],
+              "load_each_side": true,
+              "reps_in_reserve": null,
+              "sets": 3,
+              "reps": "12–16",
+              "rest_seconds": null
+            }
+          ]
+        },
+        {
+          "day": 1,
+          "kind": "rest",
+          "title": "",
+          "exercises": []
+        },
+        {
+          "day": 2,
+          "kind": "rest",
+          "title": "",
+          "exercises": []
+        },
+        {
+          "day": 3,
+          "kind": "rest",
+          "title": "",
+          "exercises": []
+        },
+        {
+          "day": 4,
+          "kind": "rest",
+          "title": "",
+          "exercises": []
+        },
+        {
+          "day": 5,
+          "kind": "rest",
+          "title": "",
+          "exercises": []
+        },
+        {
+          "day": 6,
+          "kind": "rest",
+          "title": "",
+          "exercises": []
+        }
+      ]
+    },
+    "diet": {
+      "mode": "personalized",
+      "note": "",
+      "menus": [
+        {
+          "id": "A",
+          "meals": [
+            {
+              "slot": "breakfast",
+              "title": "Meal 1",
+              "ingredients": []
+            },
+            {
+              "slot": "lunch",
+              "title": "Meal 2",
+              "ingredients": []
+            },
+            {
+              "slot": "snack",
+              "title": "Meal 3",
+              "ingredients": []
+            },
+            {
+              "slot": "dinner",
+              "title": "Meal 4",
+              "ingredients": []
+            }
+          ]
+        },
+        {
+          "id": "B",
+          "meals": [
+            {
+              "slot": "breakfast",
+              "title": "Meal 1",
+              "ingredients": []
+            },
+            {
+              "slot": "lunch",
+              "title": "Meal 2",
+              "ingredients": []
+            },
+            {
+              "slot": "snack",
+              "title": "Meal 3",
+              "ingredients": []
+            },
+            {
+              "slot": "dinner",
+              "title": "Meal 4",
+              "ingredients": []
+            }
+          ]
+        }
+      ]
+    }
+  }
+}
