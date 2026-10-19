@@ -3,7 +3,10 @@ import express from 'express';
 import cors from 'cors';
 import sharp from 'sharp';
 import {randomUUID} from 'node:crypto';
-import {pathToFileURL} from 'node:url';
+import {pathToFileURL,fileURLToPath} from 'node:url';
+import {createRequire} from 'node:module';
+import {inspectSource,compareCoverage,requireReviewedCoverage} from './source-coverage.mjs';
+const require=createRequire(import.meta.url);
 import {ImportError,digest,parseAiJson,pickSeries,buildProgram,buildPrompt,stableId} from './workout.mjs';
 export {parseAiJson,pickSeries,buildProgram} from './workout.mjs';
 const defaults=['https://hulkfitnessarena.in','https://www.hulkfitnessarena.in','https://app.flutterflow.io'];
@@ -11,6 +14,7 @@ const positive=(v,fallback,max)=>{if(v===undefined||v==='')return fallback;const
 export function configFromEnv(env=process.env){
  const origins=(env.ALLOWED_ORIGINS||defaults.join(',')).split(',').map(s=>s.trim()).filter(Boolean);
  if(!origins.length||origins.some(s=>{try{return s==='*'||!/^https?:\/\//.test(s)||new URL(s).origin!==s;}catch{return true;}}))throw Error('ALLOWED_ORIGINS must contain exact HTTP(S) origins, never *.');
+ for(const ownOrigin of [env.RENDER_EXTERNAL_URL,env.IMPORT_APP_ORIGIN].filter(Boolean)){let origin;try{origin=new URL(ownOrigin).origin;}catch{throw Error('Invalid import page origin');}if(!/^https?:\/\//.test(ownOrigin)||origin!==ownOrigin.replace(/\/$/,''))throw Error('Invalid import page origin');if(!origins.includes(origin))origins.push(origin);}
  return {supabaseUrl:(env.SUPABASE_URL||'').replace(/\/$/,''),supabaseKey:env.SUPABASE_ANON_KEY||env.SUPABASE_PUBLISHABLE_KEY||'',nvidiaKey:env.NVIDIA_API_KEY||'',model:env.NVIDIA_MODEL||'',endpoint:env.NVIDIA_ENDPOINT||'https://integrate.api.nvidia.com/v1/chat/completions',origins,jsonLimit:positive(env.MAX_JSON_BYTES,16*1024*1024,20*1024*1024),maxImageBytes:positive(env.MAX_IMAGE_BYTES,5*1024*1024,10*1024*1024),maxImages:positive(env.MAX_IMAGES,4,10),inlineCap:env.NVIDIA_MAX_IMAGE_BASE64_CHARS?positive(env.NVIDIA_MAX_IMAGE_BASE64_CHARS,0,20*1024*1024):0,maxEdge:positive(env.IMAGE_MAX_EDGE,4096,8192),aiTimeout:positive(env.AI_TIMEOUT_MS,90000,120000),dailyLimit:positive(env.IMPORTS_PER_OWNER_PER_DAY,200,10000),minuteLimit:positive(env.IMPORTS_PER_OWNER_PER_MINUTE,6,60)};
 }
 const bad=(code,message,status=400,extra)=>{throw new ImportError(code,message,status,extra);};
@@ -56,14 +60,28 @@ export async function askNvidia({images,text,config,fetcher=fetch,diagnostics=fa
   throw e;
  }
 }
-export function createApp({config=configFromEnv(),fetcher=fetch,logger=console,now=Date.now,extract=askNvidia}={}){
+export function createApp({config=configFromEnv(),fetcher=fetch,logger=console,now=Date.now,extract=askNvidia,inspect=inspectSource}={}){
  const app=express(),usage=new Map(),inflight=new Map();app.disable('x-powered-by');
  const missing=()=>['supabaseUrl','supabaseKey','nvidiaKey','model'].filter(k=>!config[k]);
  const replyError=(res,e,requestId)=>res.status(e instanceof ImportError?e.status:500).json({success:false,error:e instanceof ImportError?e.message:'Unexpected backend error. Check Render logs using the request ID.',code:e instanceof ImportError?e.code:'internal_error',requestId,...(e instanceof ImportError?e.extra:{})});
  app.use((req,res,next)=>{req.requestId=randomUUID();res.set('X-Request-ID',req.requestId);res.set('Cache-Control','no-store');next();});
  app.use((req,res,next)=>{const origin=req.headers.origin;if(origin&&!config.origins.includes(origin))return replyError(res,new ImportError('origin_blocked','This browser origin is not allowed. Add its exact origin to ALLOWED_ORIGINS.',403),req.requestId);next();});
  app.use(cors({origin:(origin,done)=>done(null,!origin||config.origins.includes(origin)),methods:['GET','POST','OPTIONS'],allowedHeaders:['Content-Type','Authorization','X-Request-ID'],exposedHeaders:['X-Request-ID'],maxAge:600}));
- app.get('/health',(_req,res)=>res.json({ok:true,version:'2.0.0',configured:missing().length===0,message:'Process is running. This does not verify NVIDIA or database connectivity.'}));
+ const publicDir=fileURLToPath(new URL('./import-ui/',import.meta.url));
+ app.use('/import-assets',express.static(publicDir,{index:false,dotfiles:'deny',setHeaders(res){res.set('X-Content-Type-Options','nosniff');}}));
+ app.get('/import-assets/supabase.js',(_req,res)=>res.sendFile(require.resolve('@supabase/supabase-js').replace(/index\.(?:cjs|mjs)$/, 'umd/supabase.js')));
+ app.get('/workout-import',(_req,res)=>{
+  const connect=["'self'",config.supabaseUrl].filter(Boolean).join(' ');
+  res.set('Content-Security-Policy',`default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' blob: data:; connect-src ${connect}; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'`);
+  res.set('X-Content-Type-Options','nosniff');res.set('Referrer-Policy','no-referrer');res.sendFile(publicDir+'index.html');
+ });
+ app.get('/import-config',(_req,res)=>{
+  let publicKey=config.supabaseKey.startsWith('sb_publishable_');
+  try{publicKey ||= JSON.parse(Buffer.from(config.supabaseKey.split('.')[1]||'','base64url').toString()).role==='anon';}catch{}
+  if(!publicKey)return replyError(res,new ImportError('public_key_required','Configure a public Supabase anon/publishable key for owner sign-in. Never use a service-role or secret key here.',503),_req.requestId);
+  res.json({supabaseUrl:config.supabaseUrl,supabasePublishableKey:config.supabaseKey});
+ });
+ app.get('/health',(_req,res)=>res.json({ok:true,version:'2.1.0',configured:missing().length===0,message:'Process is running. This does not verify NVIDIA or database connectivity.'}));
  async function db(path,token,{method='GET',body,write=false}={}){
   let r;try{r=await fetcher(config.supabaseUrl+'/rest/v1/'+path,{method,headers:{apikey:config.supabaseKey,Authorization:'Bearer '+token,'Content-Type':'application/json',...(write?{Prefer:'return=representation'}:{})},...(body===undefined?{}:{body:JSON.stringify(body)}),signal:AbortSignal.timeout(15000)});}catch{bad('database_unreachable','Database request timed out or failed. A write may have completed; retry the identical input to check the same record.',503);}
   let data;try{data=JSON.parse(await readBody(r,250000));}catch{bad('database_response','Database returned an unreadable response.',502);}
@@ -81,15 +99,18 @@ export function createApp({config=configFromEnv(),fetcher=fetch,logger=console,n
    req.actor={id:user.id,token};next();
   }catch(e){replyError(res,e,req.requestId);}
  }
+ app.get('/import-session',authenticate,async(req,res)=>{
+  try{const series=await db('training_series?select=id,code,title,status,revision&order=sort_order',req.actor.token);res.json({success:true,series:series.filter(s=>['hulk_fit','alpha','aura','goat'].includes(s.code)&&s.status!=='archived')});}catch(e){replyError(res,e,req.requestId);}
+ });
  app.post('/extract-workout',authenticate,express.json({limit:config.jsonLimit,strict:true}),async(req,res)=>{
   const stage=name=>{logger.info?.(JSON.stringify({requestId:req.requestId,stage:name}));};
-  let leased=false;
+  let leased=false,sourceCheck;
   try{
    stage('backend_received');if(!req.is('application/json'))bad('content_type','Send Content-Type: application/json.',415);
    const body=req.body;if(!body||Array.isArray(body))bad('request_invalid','Send one JSON object.');
    const clean=(v,key,max)=>{if(v===undefined||v===null||v==='null'||v==='undefined')return '';if(typeof v!=='string'||v.length>max)bad('request_invalid',key+' must be a String within the documented limit.');return v.trim();};
    const text=clean(body.workoutText,'workoutText',20000),title=clean(body.title,'title',140),code=clean(body.seriesCode,'seriesCode',30),action=body.action||'import';
-   if(!['import','preview'].includes(action))bad('action_invalid','Supported actions: import (draft only) or preview (no save).');
+   if(!['import','preview','save_reviewed'].includes(action))bad('action_invalid','Supported actions: preview or save_reviewed; legacy text imports remain draft-only.');
    const {id:userId,token}=req.actor;
    const seriesRows=await db('training_series?select=id,code,title,status,revision&order=sort_order',token),series=pickSeries(code,seriesRows);
    const inputs=[];if(body.imageBase64!==undefined&&body.imageBase64!==null&&!(typeof body.imageBase64==='string'&&['','null','undefined'].includes(body.imageBase64.trim())))inputs.push(body.imageBase64);
@@ -100,25 +121,33 @@ export function createApp({config=configFromEnv(),fetcher=fetch,logger=console,n
    const programId=stableId(`${userId}:${series.id}:${fingerprint}`);
    const existing=async()=>{const rows=await db('training_programs?select=id,title,status,series_id,content&id=eq.'+programId,token);return rows?.[0];};
    const resultFor=(row,duplicate=false)=>({success:true,message:duplicate?'This import already exists; the existing record was not changed.':`Saved "${row.title}" to ${series.title} as a draft.`,programId:row.id,series:series.code,title:row.title,status:row.status,exerciseCount:row.content.workout.sessions.reduce((n,s)=>n+(s.exercises?.length||0),0),duplicate,requestId:req.requestId});
-   if(action==='import'){const prior=await existing();if(prior){if(prior.series_id!==series.id)bad('import_conflict','Import identifier conflicts with another series.',409);return res.json(resultFor(prior,true));}}
+   if(action==='import'||action==='save_reviewed'){const prior=await existing();if(prior){if(prior.series_id!==series.id)bad('import_conflict','Import identifier conflicts with another series.',409);return res.json(resultFor(prior,true));}}
    if(inflight.has(userId))bad('import_busy','Another import is running for this owner. Wait for its result.',409);inflight.set(userId,req.requestId);leased=true;
-   if(missing().length)bad('configuration_missing','Configure NVIDIA_API_KEY and NVIDIA_MODEL before importing.',503);
+   if(action!=='save_reviewed'&&missing().length)bad('configuration_missing','Configure NVIDIA_API_KEY and NVIDIA_MODEL before importing.',503);
    const date=Math.floor(now()/86400000),minute=Math.floor(now()/60000),previous=usage.get(userId)||{},dayCount=previous.day===date?previous.dayCount:0,minuteCount=previous.minute===minute?previous.minuteCount:0;
-   if(dayCount>=config.dailyLimit||minuteCount>=config.minuteLimit)bad('import_rate_limited','Owner import limit reached. Wait before retrying.',429);
-   usage.set(userId,{day:date,minute,dayCount:dayCount+1,minuteCount:minuteCount+1});
+   if(action!=='save_reviewed'&&(dayCount>=config.dailyLimit||minuteCount>=config.minuteLimit))bad('import_rate_limited','Owner import limit reached. Wait before retrying.',429);
+   if(action!=='save_reviewed')usage.set(userId,{day:date,minute,dayCount:dayCount+1,minuteCount:minuteCount+1});
    const images=[];for(const b of raw)images.push(await prepareImage(b,config));stage('input_validated');
-   const ai=await extract({images,text,config,fetcher,diagnostics:action==='preview'});stage('ai_extracted');
+   if(action==='import'&&images.length)bad('review_required','Image imports require owner review. Open /workout-import, review the complete table and save a draft.',422);
+   const source=await inspect({images,text});sourceCheck={source};
+   const hint=source.status==='counted'?'\nIndependent source table counts (check the image for values): '+source.tables.map((t,i)=>`exercise ${i+1}: ${t.sets} sets`).join('; '):'';
+   const ai=action==='save_reviewed'?body.reviewedWorkout:await extract({images,text:text+hint,config,fetcher,diagnostics:action==='preview'});stage(action==='save_reviewed'?'review_received':'ai_extracted');
+   sourceCheck=compareCoverage(source,ai);
+   if(action==='save_reviewed')sourceCheck=requireReviewedCoverage(source,ai,body);
+   else if(sourceCheck.status==='mismatch')bad('source_mismatch','Extraction is incomplete compared with the source. Review and correct it; nothing was saved.',422,{review:ai,sourceCheck});
+
    let built;try{built=buildProgram(ai,{series,userId,fingerprint,title,id:programId});}catch(e){if(e instanceof ImportError){e.extra={...(e.extra||{}),review:ai};}throw e;}
    stage('studio_validated');const warnings=built.warnings;
    if(images.some(x=>x.resized))warnings.push('A large image was resized; verify small text against the source.');
-   if(action==='preview')return res.json({success:true,message:'Preview ready. Nothing has been saved.',program:built.program,exerciseCount:built.exerciseCount,warnings,requestId:req.requestId});
+   if(action==='preview')return res.json({success:true,message:'Preview ready. Nothing has been saved.',program:built.program,review:ai,sourceCheck,reviewRequired:true,exerciseCount:built.exerciseCount,warnings,requestId:req.requestId});
    // The reviewed canonical shape is validated first. A deterministic primary key makes creation atomic and retry-safe.
    // All REST calls use the caller JWT and public key, so existing owner RLS still applies. No upsert/update/delete.
+   if(action==='save_reviewed'){built.program.description='Owner-reviewed image/text import. Saved as a draft for Studio review before publishing.';built.program.content.workout.note='Owner confirmed source values and counts. '+(sourceCheck.status==='owner_confirmed'?'Manual source counts: '+sourceCheck.manualSetCounts.join(', ')+(sourceCheck.overrideReason?'; OCR override: '+sourceCheck.overrideReason:'')+'. ':'')+'Not assigned to members.';}
    const saved=await db('training_programs?select=id,title,status,series_id,content',token,{method:'POST',body:built.program,write:true});
    let row=saved?.[0],duplicate=false;if(saved.conflict){row=await existing();duplicate=true;}
    if(!row||row.id!==programId||row.series_id!==series.id)bad('save_unconfirmed','Save result could not be confirmed. Retry identical input before creating a different import.',503);
-   stage('draft_saved');res.status(duplicate?200:201).json({...resultFor(row,duplicate),warnings});
-  }catch(e){logger.error?.(JSON.stringify({requestId:req.requestId,code:e instanceof ImportError?e.code:'internal_error'}));replyError(res,e,req.requestId);}
+   stage('draft_saved');res.status(duplicate?200:201).json({...resultFor(row,duplicate),warnings,sourceCheck});
+  }catch(e){if(sourceCheck&&e instanceof ImportError)e.extra={...e.extra,sourceCheck:e.extra?.sourceCheck||sourceCheck};logger.error?.(JSON.stringify({requestId:req.requestId,code:e instanceof ImportError?e.code:'internal_error'}));replyError(res,e,req.requestId);}
   finally{if(leased&&inflight.get(req.actor.id)===req.requestId)inflight.delete(req.actor.id);}
  });
  app.use((err,req,res,_next)=>replyError(res,err.type==='entity.too.large'?new ImportError('payload_too_large','JSON body exceeds the configured byte limit.',413):err.type==='entity.parse.failed'?new ImportError('invalid_json','Request body is not valid JSON.',400):err,req.requestId));
