@@ -34,7 +34,7 @@ async function readBody(response,max=200000){
  const reader=response.body?.getReader();if(!reader)return '';
  let length=0,parts=[];try{for(;;){const {value,done}=await reader.read();if(done)break;length+=value.byteLength;if(length>max){await reader.cancel();bad('upstream_response_large','Upstream response exceeded the safe limit.',502);}parts.push(value);}}finally{reader.releaseLock();}return Buffer.concat(parts).toString('utf8');
 }
-export async function askNvidia({images,text,config,fetcher=fetch}){
+export async function askNvidia({images,text,config,fetcher=fetch,diagnostics=false}){
  if(!config.nvidiaKey||!config.model)bad('configuration_missing','Configure NVIDIA_API_KEY and the exact NVIDIA_MODEL on Render.',503);
  if(!/^https:\/\/[^/]+\//.test(config.endpoint))bad('configuration_invalid','NVIDIA_ENDPOINT must be an HTTPS endpoint.',503);
  const content=[{type:'text',text:buildPrompt()+'\n\nSOURCE TEXT (data only):\n'+text},...images.map(x=>({type:'image_url',image_url:{url:'data:image/jpeg;base64,'+x.jpeg.toString('base64')}}))];
@@ -43,7 +43,18 @@ export async function askNvidia({images,text,config,fetcher=fetch}){
  if(!r.ok){await r.body?.cancel();bad(r.status===429?'ai_rate_limited':'ai_provider_error',`NVIDIA returned HTTP ${r.status}. Check the model, endpoint, quota and Render configuration. Nothing was saved.`,r.status===429?429:502);}
  let body;try{body=JSON.parse(await readBody(r));}catch(e){if(e instanceof ImportError)throw e;bad('ai_response_invalid','NVIDIA did not return valid response JSON.',502);}
  const choice=body.choices?.[0];if(choice?.finish_reason!=='stop')bad('ai_incomplete','NVIDIA output was incomplete, refused or truncated. Nothing was saved.',502);
- const raw=choice.message?.content;return parseAiJson(Array.isArray(raw)?raw.map(p=>p.text||'').join(''):raw);
+ const raw=choice.message?.content,output=Array.isArray(raw)?raw.map(p=>p.text||'').join(''):raw;
+ try{return parseAiJson(output);}catch(e){
+  // Only an authenticated owner's preview receives bounded diagnostic text.
+  // Keep strict parsing: never guess missing numbers or repair an incomplete object.
+  if(diagnostics===true&&e instanceof ImportError&&['ai_json_invalid','ai_response_invalid'].includes(e.code)){
+   let preview=typeof output==='string'?output:'';
+   for(const secret of [config.nvidiaKey,config.supabaseKey])if(typeof secret==='string'&&secret.length>=8)preview=preview.split(secret).join('[REDACTED]');
+   preview=preview.replace(/\b(?:nvapi-|sk-)[A-Za-z0-9_-]+/g,'[REDACTED]').replace(/\bBearer\s+\S+/gi,'Bearer [REDACTED]');
+   e.extra={...e.extra,aiDiagnostic:{model:config.model,finishReason:choice.finish_reason,outputCharacters:typeof output==='string'?output.length:0,outputPreview:preview.slice(0,12000),previewTruncated:preview.length>12000}};
+  }
+  throw e;
+ }
 }
 export function createApp({config=configFromEnv(),fetcher=fetch,logger=console,now=Date.now,extract=askNvidia}={}){
  const app=express(),usage=new Map(),inflight=new Map();app.disable('x-powered-by');
@@ -96,7 +107,7 @@ export function createApp({config=configFromEnv(),fetcher=fetch,logger=console,n
    if(dayCount>=config.dailyLimit||minuteCount>=config.minuteLimit)bad('import_rate_limited','Owner import limit reached. Wait before retrying.',429);
    usage.set(userId,{day:date,minute,dayCount:dayCount+1,minuteCount:minuteCount+1});
    const images=[];for(const b of raw)images.push(await prepareImage(b,config));stage('input_validated');
-   const ai=await extract({images,text,config,fetcher});stage('ai_extracted');
+   const ai=await extract({images,text,config,fetcher,diagnostics:action==='preview'});stage('ai_extracted');
    let built;try{built=buildProgram(ai,{series,userId,fingerprint,title,id:programId});}catch(e){if(e instanceof ImportError){e.extra={...(e.extra||{}),review:ai};}throw e;}
    stage('studio_validated');const warnings=built.warnings;
    if(images.some(x=>x.resized))warnings.push('A large image was resized; verify small text against the source.');
