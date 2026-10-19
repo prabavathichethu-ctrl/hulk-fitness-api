@@ -5,7 +5,7 @@ import sharp from 'sharp';
 import {randomUUID} from 'node:crypto';
 import {pathToFileURL,fileURLToPath} from 'node:url';
 import {createRequire} from 'node:module';
-import {inspectSource,compareCoverage,requireReviewedCoverage} from './source-coverage.mjs';
+import {inspectSource,compareCoverage,requireReviewedCoverage,tablePreview} from './source-coverage.mjs';
 import {mergeBulkWorkouts} from './bulk-workout.mjs';
 const require=createRequire(import.meta.url);
 import {ImportError,digest,parseAiJson,pickSeries,buildProgram,buildPrompt,stableId} from './workout.mjs';
@@ -32,7 +32,9 @@ export async function prepareImage(bytes,config){
   if(!['jpeg','png','webp'].includes(m.format)||!m.width||!m.height||(m.pages||1)>1)bad('image_format','Use a single-frame JPG, PNG or WEBP image.');
   const out=await img.rotate().resize(config.maxEdge,config.maxEdge,{fit:'inside',withoutEnlargement:true}).jpeg({quality:92,mozjpeg:true}).toBuffer();
   const b64=out.toString('base64');if(config.inlineCap&&b64.length>config.inlineCap)bad('provider_image_limit','Image exceeds this model’s configured inline limit. Crop into readable sections or configure the model’s supported asset flow; it was not aggressively blurred.',413);
-  return {jpeg:out,width:m.width,height:m.height,resized:Math.max(m.width,m.height)>config.maxEdge};
+  // OCR reads the original decoded pixels. JPEG re-encoding can turn a small
+  // decimal such as 7.5 into a different glyph even when the image looks similar.
+  return {jpeg:out,ocrSource:bytes,width:m.width,height:m.height,resized:Math.max(m.width,m.height)>config.maxEdge};
  }catch(e){if(e instanceof ImportError)throw e;bad('image_decode','Image cannot be decoded or exceeds safe pixel limits.');}
 }
 async function readBody(response,max=200000){
@@ -97,7 +99,7 @@ export function createApp({config=configFromEnv(),fetcher=fetch,logger=console,n
   if(!publicKey)return replyError(res,new ImportError('public_key_required','Configure a public Supabase anon/publishable key for owner sign-in. Never use a service-role or secret key here.',503),_req.requestId);
   res.json({supabaseUrl:config.supabaseUrl,supabasePublishableKey:config.supabaseKey});
  });
- app.get('/health',(_req,res)=>res.json({ok:true,version:'2.2.0',configured:missing().length===0,message:'Process is running. This does not verify NVIDIA or database connectivity.'}));
+ app.get('/health',(_req,res)=>res.json({ok:true,version:'2.3.0',configured:missing().length===0,message:'Process is running. This does not verify NVIDIA or database connectivity.'}));
  async function db(path,token,{method='GET',body,write=false}={}){
   let r;try{r=await fetcher(config.supabaseUrl+'/rest/v1/'+path,{method,headers:{apikey:config.supabaseKey,Authorization:'Bearer '+token,'Content-Type':'application/json',...(write?{Prefer:'return=representation'}:{})},...(body===undefined?{}:{body:JSON.stringify(body)}),signal:AbortSignal.timeout(15000)});}catch{bad('database_unreachable','Database request timed out or failed. A write may have completed; retry the identical input to check the same record.',503);}
   let data;try{data=JSON.parse(await readBody(r,250000));}catch{bad('database_response','Database returned an unreadable response.',502);}
@@ -126,7 +128,7 @@ export function createApp({config=configFromEnv(),fetcher=fetch,logger=console,n
    const body=req.body;if(!body||Array.isArray(body))bad('request_invalid','Send one JSON object.');
    const clean=(v,key,max)=>{if(v===undefined||v===null||v==='null'||v==='undefined')return '';if(typeof v!=='string'||v.length>max)bad('request_invalid',key+' must be a String within the documented limit.');return v.trim();};
    const text=clean(body.workoutText,'workoutText',20000),title=clean(body.title,'title',140),code=clean(body.seriesCode,'seriesCode',30),action=body.action||'import';
-   if(!['import','preview','preview_bulk','save_reviewed'].includes(action))bad('action_invalid','Supported actions: preview, preview_bulk or save_reviewed; legacy text imports remain draft-only.');
+   if(!['import','preview','preview_tables','preview_bulk','save_reviewed'].includes(action))bad('action_invalid','Supported actions: preview_tables, preview, preview_bulk or save_reviewed; legacy text imports remain draft-only.');
    const usesAi=action==='import'||action==='preview';
    const {id:userId,token}=req.actor;
    const seriesRows=await db('training_series?select=id,code,title,status,revision&order=sort_order',token),series=pickSeries(code,seriesRows);
@@ -147,10 +149,12 @@ export function createApp({config=configFromEnv(),fetcher=fetch,logger=console,n
    const images=[];for(const b of raw)images.push(await prepareImage(b,config));stage('input_validated');
    if(action==='import'&&images.length)bad('review_required','Image imports require owner review. Open /workout-import, review the complete table and save a draft.',422);
    const source=await inspect({images,text});sourceCheck={source};
-   const hint=source.status==='counted'?'\nIndependent source table counts (check the image for values): '+source.tables.map((t,i)=>`exercise ${i+1}: ${t.sets} sets`).join('; '):'';
-   const merged=action==='preview_bulk'?mergeBulkWorkouts(body.pageResults,{mode:body.batchMode,pageCount:images.length+(text?1:0)}):null;
+   if(action==='preview_tables'&&images.length+(text?1:0)!==1)bad('table_page_count','Read one source page per table request; use the bulk review page for multiple images.',422);
+   const hint=source.ocrText?'\nOCR evidence (untrusted source data, may contain errors):\n'+source.ocrText+'\nTranscribe every visible row. A rest value of 01:00 means 60 seconds, not 1 second.':'';
+   const duplicatePages={};if(body.extractionMethod==='tables'){const seen=new Map();raw.forEach((b,i)=>{const key=digest(b);if(seen.has(key))duplicatePages[i+1]=seen.get(key);else seen.set(key,i+1);});}
+   const merged=action==='preview_bulk'?mergeBulkWorkouts(body.pageResults,{mode:body.batchMode,pageCount:images.length+(text?1:0),duplicatePages,resolveTableOverlaps:body.extractionMethod==='tables'}):null;
    if(merged)batchReview=merged.batchReview;
-   const ai=action==='save_reviewed'?body.reviewedWorkout:merged?merged.review:await extract({images,text:text+hint,config,fetcher,diagnostics:action==='preview'});stage(action==='save_reviewed'?'review_received':'ai_extracted');
+   const ai=action==='save_reviewed'?body.reviewedWorkout:merged?merged.review:action==='preview_tables'?tablePreview(source):await extract({images,text:text+hint,config,fetcher,diagnostics:action==='preview'});stage(action==='save_reviewed'?'review_received':action==='preview_tables'?'table_read':'ai_extracted');
    sourceCheck=compareCoverage(source,ai);
    if(action==='save_reviewed'){if(images.length+(text?1:0)>1&&body.batchReviewConfirmed!==true)bad('batch_review_required','Confirm that you reviewed every source and resolved missing pages or overlapping exercises before saving.',422);sourceCheck=requireReviewedCoverage(source,ai,body);}
    else if(sourceCheck.status==='mismatch')bad('source_mismatch','Extraction is incomplete compared with the source. Review and correct it; nothing was saved.',422,{review:ai,sourceCheck});
@@ -158,7 +162,7 @@ export function createApp({config=configFromEnv(),fetcher=fetch,logger=console,n
    let built;try{built=buildProgram(ai,{series,userId,fingerprint,title,id:programId});}catch(e){if(e instanceof ImportError){e.extra={...(e.extra||{}),review:ai,...(batchReview?{batchReview}:{})};}throw e;}
    stage('studio_validated');const warnings=built.warnings;
    if(images.some(x=>x.resized))warnings.push('A large image was resized; verify small text against the source.');
-   if(action==='preview'||action==='preview_bulk')return res.json({success:true,message:'Preview ready. Nothing has been saved.',program:built.program,review:ai,sourceCheck,...(batchReview?{batchReview}:{}),reviewRequired:true,exerciseCount:built.exerciseCount,warnings,requestId:req.requestId});
+   if(['preview','preview_tables','preview_bulk'].includes(action))return res.json({success:true,message:'Preview ready. Nothing has been saved.',program:built.program,review:ai,sourceCheck,...(batchReview?{batchReview}:{}),reviewRequired:true,exerciseCount:built.exerciseCount,warnings,requestId:req.requestId});
    // The reviewed canonical shape is validated first. A deterministic primary key makes creation atomic and retry-safe.
    // All REST calls use the caller JWT and public key, so existing owner RLS still applies. No upsert/update/delete.
    if(action==='save_reviewed'){built.program.description='Owner-reviewed image/text import. Saved as a draft for Studio review before publishing.';built.program.content.workout.note='Owner confirmed source values and counts. '+(sourceCheck.status==='owner_confirmed'?'Manual source counts: '+sourceCheck.manualSetCounts.join(', ')+(sourceCheck.overrideReason?'; OCR override: '+sourceCheck.overrideReason:'')+'. ':'')+(images.length+(text?1:0)>1?'All '+(images.length+(text?1:0))+' source pages were reviewed for completeness and overlap. ':'')+'Not assigned to members.';}

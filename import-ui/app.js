@@ -34,7 +34,7 @@ async function captureSource(){
  if(!files.length&&!text)throw Error('Choose a workout image or paste the complete workout.');
  if(files.length>4||files.some(f=>f.size>5*1024*1024)||files.reduce((n,f)=>n+f.size,0)>10*1024*1024)throw Error('Use up to 4 images, each under 5 MB and under 10 MB combined.');
  const images=[];for(const f of files){if(!['image/jpeg','image/png','image/webp'].includes(f.type))throw Error('Use JPG, PNG or WEBP images.');images.push(await new Promise((resolve,reject)=>{const reader=new FileReader();reader.onload=()=>resolve(reader.result.split(',')[1]);reader.onerror=()=>reject(Error('Image could not be read.'));reader.readAsDataURL(f);}));}
- return {seriesCode:$('series').value,workoutText:text,images,batchMode:$('batch-mode').value};
+ return {seriesCode:$('series').value,workoutText:text,images,batchMode:$('batch-mode').value,extractionMethod:$('extraction-method').value};
 }
 function displaySources(){
  state.urls.forEach(u=>URL.revokeObjectURL(u));state.urls=[];$('sources').replaceChildren();
@@ -59,6 +59,7 @@ function renderSessions(){
   field(fields,'Source day/session label (if present)',d.source_day_label,v=>d.source_day_label=v||null,{max:100});section.append(fields);
   d.exercises.forEach((e,ei)=>{
    const card=node('article',undefined,'exercise'),bar=node('div',undefined,'actions');bar.append(node('h4','Exercise '+(ei+1)),button('Remove exercise',()=>{d.exercises.splice(ei,1);renderSessions();edited();},'quiet danger'));card.append(bar);if(Array.isArray(e.source_images))card.append(node('p','Source: image/page '+e.source_images.join(', '),'hint'));
+   if(e.source_note)card.append(node('p',e.source_note,'hint'));
    field(card,'Exercise name',e.name,v=>e.name=v,{max:120});
    const ef=node('div',undefined,'fields');
    field(ef,'Equipment',e.equipment||'',v=>e.equipment=v,{kind:'select',options:[['','Choose equipment'],['gym','Gym'],['dumbbell','Dumbbell'],['band','Band'],['bodyweight','Bodyweight']]});
@@ -86,7 +87,7 @@ function coverageIssues(){
  const src=state.sourceCheck?.source,es=state.workout.days.flatMap(d=>d.exercises),issues=[];
  if(src?.status==='counted'){
   if(es.length!==src.tables.length)issues.push(`Source: ${src.tables.length} exercises. Reviewed table: ${es.length}.`);
-  src.tables.forEach((t,i)=>{if(es[i]?.set_details.length!==t.sets)issues.push(`Source exercise ${i+1}: ${t.sets} sets; reviewed table: ${es[i]?.set_details.length||0}.`);if(t.restRows&&es[i]?.set_details.filter(r=>typeof r.rest_seconds==='number').length!==t.restRows)issues.push(`Exercise ${i+1}: source rest values are missing.`);});
+  src.tables.forEach((t,i)=>{if(es[i]?.set_details.length!==t.sets)issues.push(`Source exercise ${i+1}: ${t.sets} sets; reviewed table: ${es[i]?.set_details.length||0}.`);if(t.restRows&&es[i]?.set_details.filter(r=>typeof r.rest_seconds==='number').length!==t.restRows)issues.push(`Exercise ${i+1}: source rest values are missing.`);t.rows?.forEach((r,j)=>{for(const k of ['kg','reps','rest_seconds'])if(r[k]!=null&&(k!=='kg'||r.weightRead)&&es[i]?.set_details[j]?.[k]!==r[k])issues.push(`Exercise ${i+1}, set ${j+1}: ${k} differs from OCR. Check the image and correct it, or explain the OCR error below.`);});});
  }
  const manual=countsInput(),matches=manual.length===es.length&&manual.length>0&&manual.every((n,i)=>Number.isInteger(n)&&n>=1&&n<=6&&es[i].set_details.length===n);
  if(src?.status!=='counted')return matches?[]:['Enter the source sets for every exercise in “Confirm or correct the source counts”.'];
@@ -107,12 +108,12 @@ function updateGate(){
 function renderBatchSummary(batch){
  const count=state.source.images.length+(state.source.workoutText?1:0);$('batch-confirm-label').hidden=count<2;$('batch-summary').replaceChildren();
  if(!batch)return;const box=node('div',undefined,'status');box.append(node('strong','All source pages need review'));const list=node('ul');
- for(const page of batch.pages){list.append(node('li','Source '+page.page+': '+(page.status==='ready'?page.exerciseCount+' exercises extracted. '+(page.message||''):'Extraction failed. '+page.message)));}
+ for(const page of batch.pages){list.append(node('li','Source '+page.page+': '+(page.status==='duplicate'?page.message:page.status==='ready'?page.exerciseCount+' exercise cards read; review required. '+(page.message||''):'Extraction failed. '+page.message)));}
  for(const message of batch.warnings)list.append(node('li',message));box.append(list);$('batch-summary').append(box);
 }
 function paintBatch(){
  $('batch-progress').hidden=false;$('page-progress').replaceChildren();
- state.batch.results.forEach((r,i)=>$('page-progress').append(node('li','Source '+(i+1)+' of '+state.batch.results.length+' · '+r.status+(r.reusedFrom?' (result reused from identical source '+r.reusedFrom+')':'')+(r.error?' — '+r.error:''))));
+ state.batch.results.forEach((r,i)=>{const status=r.status==='ready'?(r.coverageStatus==='mismatch'?'needs correction':r.coverageStatus==='unverified'?'needs source review':'rows read — review required'):r.status;const li=node('li','Source '+(i+1)+' of '+state.batch.results.length+' · '+status+(r.reusedFrom?' (result reused from identical source '+r.reusedFrom+')':'')+(r.error?' — '+r.error:''));if(r.diagnostic){const detail=node('details');detail.append(node('summary','Extraction diagnostic'),node('pre',JSON.stringify({code:r.code,requestId:r.requestId,diagnostic:r.diagnostic},null,2)));li.append(detail);}$('page-progress').append(li);});
  $('retry-batch').hidden=state.busy;const failures=state.batch.results.filter(r=>r.status!=='ready').length;$('retry-batch').textContent=failures?'Retry failed sources ('+failures+')':'Rebuild review (no AI calls)';
 }
 async function runBulk(){
@@ -122,19 +123,19 @@ async function runBulk(){
   if(state.batch.results[i].status==='ready')continue;
   if(state.batch.stop){state.batch.results[i]={status:'failed',error:'Not requested: batch was stopped. Retry this source or transcribe it manually.'};continue;}
   const source=state.batch.sources[i];state.batch.results[i]={status:'processing'};paintBatch();notice('Extracting source '+(i+1)+' of '+state.batch.sources.length+'… Completed sources will not be requested again on retry.');
-  // Reuse an identical screenshot's result, but keep both entries in review so
-  // intentional repeats versus overlaps are an explicit owner decision.
+  // Reuse identical bytes. Table-mode merging also lists the duplicate page
+  // while including its cards once; separate-session mode retains both.
   const prior=source.images.length?state.batch.sources.findIndex((s,j)=>j<i&&s.images[0]===source.images[0]&&state.batch.results[j].status==='ready'):-1;
   if(prior>=0){state.batch.results[i]=structuredClone(state.batch.results[prior]);state.batch.results[i].reusedFrom=prior+1;paintBatch();continue;}
-  try{const {r,data}=await api('/extract-workout',{seriesCode:state.source.seriesCode,...source,action:'preview'});
-   if(data.review&&Array.isArray(data.review.days)&&data.review.days.length&&data.review.days.every(d=>Array.isArray(d?.exercises)&&d.exercises.length))state.batch.results[i]={status:'ready',review:data.review,coverageStatus:data.sourceCheck?.status};
-   else state.batch.results[i]={status:'failed',error:data.error||'No usable extraction returned. Retry or enter this source manually.'};
+  try{const {r,data}=await api('/extract-workout',{seriesCode:state.source.seriesCode,...source,action:state.source.extractionMethod==='tables'?'preview_tables':'preview'});
+   if(data.review&&Array.isArray(data.review.days)&&data.review.days.length&&data.review.days.every(d=>Array.isArray(d?.exercises)&&d.exercises.length))state.batch.results[i]={status:'ready',review:data.review,coverageStatus:data.sourceCheck?.status,code:data.code};
+   else state.batch.results[i]={status:'failed',error:data.error||'No usable extraction returned. Retry or enter this source manually.',code:data.code,requestId:data.requestId,diagnostic:data.aiDiagnostic||data.providerDiagnostic};
    if(r.status===429)state.batch.stop=true;
   }catch(e){state.batch.results[i]={status:'failed',error:e.message||'Source request failed.'};if(!$('login').hidden)state.batch.stop=true;}
   paintBatch();
  }
  const {r,data}=await api('/extract-workout',{...state.source,action:'preview_bulk',pageResults:state.batch.results});
- if(data.review){openReview(data.review,data.sourceCheck,data.batchReview);notice('Bulk extraction is ready for review. Check every source and resolve missing or repeated entries. Nothing has been saved.',!r.ok);}else throw Error(data.error||'The review could not be built. Retry the review without requesting completed sources again.');
+ if(data.review){openReview(data.review,data.sourceCheck,data.batchReview);notice('Sources read. Review missing or overlapping cards, OCR names, equipment, Each Side and every numeric value. Enter the workout title and combined counts before saving. Nothing has been saved.',!r.ok);}else throw Error(data.error||'The review could not be built. Retry the review without requesting completed sources again.');
 }
 $('discard-batch').addEventListener('click',reset);
 $('stop-batch').addEventListener('click',()=>{if(state.batch){state.batch.stop=true;$('stop-batch').disabled=true;notice('The current source will finish. Remaining sources will be left for retry or manual entry.');}});
@@ -145,7 +146,7 @@ async function begin(manual=false){if(state.busy)return;setBusy(true);notice(man
  state.source=await captureSource();state.batch=null;
  if(manual){openReview(emptyWorkout(),null);notice('Enter every exercise and set, then confirm the source counts.');return;}
  if(state.source.images.length+(state.source.workoutText?1:0)>1){await runBulk();return;}
- const {r,data}=await api('/extract-workout',{...state.source,action:'preview'});
+ const {r,data}=await api('/extract-workout',{...state.source,action:state.source.extractionMethod==='tables'?'preview_tables':'preview'});
  if(data.review){openReview(data.review,data.sourceCheck);notice(r.ok?'Extraction ready. Compare the complete table with the source.':data.error,true);}
  else{openReview(emptyWorkout(),data.sourceCheck);notice((data.error||'Extraction could not be read.')+' You can enter the workout manually or start a new import.',true);}
  }catch(e){notice(e.message||'Request failed. Retry shortly.',true);}finally{setBusy(false);if(state.batch)paintBatch();}}

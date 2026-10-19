@@ -4,26 +4,42 @@ import sharp from 'sharp';
 import {createHash} from 'node:crypto';
 import {digest,ImportError} from './workout.mjs';
 
-// An independent count of visible table rows, never an OCR-to-number repair.
-// Unsupported layouts remain unverified. Even a match needs an owner's review.
+// Read only explicit SET/KG/REPS/REST rows. No fuzzy numeric repair. Headerless
+// rows remain an unnamed card, so cropped exercises cannot disappear silently.
 export function countSourceTables(text){
  const lines=text.split(/\r?\n/).map(s=>s.trim()).filter(Boolean),tables=[];
  let table=null,uncertain=false;
  for(let i=0;i<lines.length;i++){
   const line=lines[i];
   if(/\bSET\b.*\b(?:KG|LB|LBS)\b.*\bREPS\b.*\bREST\b/i.test(line)){
-   table={label:(lines[i-1]||'Exercise').slice(0,140),sets:0,restRows:0};tables.push(table);continue;
+   table={label:(lines[i-1]||'').slice(0,120),header:true,sets:0,restRows:0,rows:[]};tables.push(table);continue;
   }
-  if(!table)continue;
   // Require a set ordinal, two data cells (possibly an OCR-damaged weight),
   // and a clear mm:ss rest. Other table formats need manual source counts.
-  const row=/^(\d{1,2})\s+\S+\s+\d{1,2}\s+(\d{1,2}):([0-5]\d)\s*$/.exec(line);
-  if(row){if(Number(row[1])!==table.sets+1)uncertain=true;table.sets++;table.restRows++;}
-  else if(/^\d/.test(line))uncertain=true;
+  const row=/^(\d{1,2})\s+(\S+)\s+(\d{1,2})\s+(\d{1,2}):([0-5]\d)\s*$/.exec(line);
+  if(row){
+   if(!table){table={label:'',header:false,sets:0,restRows:0,rows:[]};tables.push(table);uncertain=true;}
+   if(Number(row[1])!==table.sets+1)uncertain=true;
+   table.sets++;table.restRows++;
+   table.rows.push({ordinal:Number(row[1]),kg:/^\d+(?:\.\d+)?$/.test(row[2])?Number(row[2]):null,reps:Number(row[3]),rest_seconds:Number(row[4])*60+Number(row[5]),weightRead:/^\d+(?:\.\d+)?$/.test(row[2]),source:line});
+  }else if(/Each Side|Add note|Tempo|Add Set/i.test(line))table=null;
+  else if(table&&/^\d/.test(line)){
+   uncertain=true;table.sets++;
+   table.rows.push({ordinal:null,kg:null,reps:null,rest_seconds:null,weightRead:false,source:line});
+  }
  }
  const verified=tables.length>0&&tables.length<=84&&!uncertain&&tables.every(t=>t.sets>=1&&t.sets<=6);
- return {status:verified?'counted':'unverified',method:'ocr-table-count',tables,
+ return {status:verified?'counted':'unverified',method:'ocr-table-count',tables,ocrText:text.slice(0,12000),
   message:verified?'Visible table counts found. Check every value and checkbox against the source.':'This layout could not be counted reliably. Enter the source exercise and set counts yourself.'};
+}
+
+export function tablePreview(source){
+ if(!source.tables?.length)throw new ImportError('table_layout_unknown','No readable SET / KG / REPS / REST table was found. Choose AI extraction for another layout, or enter the workout manually.',422);
+ const exercises=source.tables.map(t=>({name:t.header?t.label:'',name_kn:'',equipment:'gym',primary:[],secondary:[],stabilisers:[],cues:[],tempo:null,each_side:null,reps_in_reserve:null,sets:t.sets,
+  ocr_unlabelled:!t.header,ocr_rows_complete:t.rows.every((r,i)=>r.ordinal===i+1&&r.weightRead),
+  set_details:t.rows.map(r=>({kg:r.kg,reps:r.reps,rest_seconds:r.rest_seconds})),
+  source_note:!t.header?'Cropped card: its exercise heading is not visible. Match it against earlier sources or enter its name.':'OCR text: check the name, all numeric values, equipment and Each Side against the image.'}));
+ return {title:'',duration_days:null,days:[{day:null,source_day_label:null,title:'',exercises}]};
 }
 
 // One worker at a time; terminate after every job so a small Render instance
@@ -32,7 +48,7 @@ export function countSourceTables(text){
 let busy=false;
 const cache=new Map();
 export async function inspectSource({images,text}){
- const key=digest({images:images.map(i=>createHash('sha256').update(i.jpeg).digest('hex')),text}),prior=cache.get(key);
+ const key=digest({images:images.map(i=>createHash('sha256').update(i.ocrSource||i.jpeg).digest('hex')),text}),prior=cache.get(key);
  if(prior&&Date.now()-prior.at<15*60*1000)return structuredClone(prior.value);
  if(!images.length)return countSourceTables(text);
  if(images.length>1||text.trim()){
@@ -51,7 +67,7 @@ export async function inspectSource({images,text}){
    await worker.setParameters({tessedit_pageseg_mode:PSM.SINGLE_BLOCK});
    const pages=[];
    for(const image of images){
-    const bounded=await sharp(image.jpeg).resize(2200,2200,{fit:'inside',withoutEnlargement:true}).png().toBuffer();
+    const bounded=await sharp(image.ocrSource||image.jpeg,{limitInputPixels:24000000}).rotate().resize(2200,2200,{fit:'inside',withoutEnlargement:true}).png().toBuffer();
     const {data}=await worker.recognize(bounded);pages.push(countSourceTables(data.text));
    }
    return pages[0];
@@ -74,6 +90,7 @@ export function compareCoverage(source,ai){
  source.tables.forEach((t,i)=>{
   if(actual[i]?.sets!==t.sets)issues.push(`Source exercise ${i+1} has ${t.sets} set rows; extraction has ${actual[i]?.sets||0}.`);
   if(t.restRows>0&&actual[i]?.restRows!==t.restRows)issues.push(`Source exercise ${i+1}: visible rest values are missing from the extraction.`);
+  t.rows?.forEach((r,j)=>{const row=(Array.isArray(ai?.days)?ai.days.flatMap(d=>d?.exercises||[]):[])[i]?.set_details?.[j];for(const k of ['kg','reps','rest_seconds'])if(r[k]!=null&&(k!=='kg'||r.weightRead)&&row?.[k]!==r[k])issues.push(`Source exercise ${i+1}, set ${j+1}: ${k} differs from the OCR reading; compare with the original image.`);});
  });
  return {status:issues.length?'mismatch':'counts_match',actual,issues,source};
 }

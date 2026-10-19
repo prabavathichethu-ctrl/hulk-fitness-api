@@ -4,12 +4,18 @@ const nameKey=v=>label(v).normalize('NFKC').toLowerCase().replace(/[^\p{L}\p{N}]
 
 // Concatenate complete page extractions in source order. Never guess overlapping
 // sets or silently discard repeated exercises. Their resolution belongs to review.
-export function mergeBulkWorkouts(results,{mode='same_workout',pageCount}={}){
+export function mergeBulkWorkouts(results,{mode='same_workout',pageCount,duplicatePages={},resolveTableOverlaps=false}={}){
  if(!['same_workout','preserve_sessions'].includes(mode)||!Number.isInteger(pageCount)||pageCount<2||pageCount>11||!Array.isArray(results)||results.length!==pageCount)throw new ImportError('batch_invalid','Send one ordered result for every source image/text page and choose a valid batch mode.',422);
- const pages=[],allDays=[],failed=[],warnings=[],sourceDurations=[],sourceTitles=[];
+ const pages=[],allDays=[],failed=[],warnings=[],sourceDurations=[],sourceTitles=[],resolvedOverlaps=[];
  let title='';
  for(let i=0;i<results.length;i++){
   const result=results[i],w=result?.review;
+  const identical=duplicatePages[i+1];
+  if(mode==='same_workout'&&Number.isInteger(identical)&&identical>=1&&identical<i+1&&pages.some(p=>p.page===identical&&p.status==='ready')){
+   pages.push({page:i+1,status:'duplicate',duplicateOf:identical,message:`Byte-identical image of source ${identical}; its exercise cards are included once.`});
+   for(const d of allDays)for(const e of d.exercises)if(e.source_images.includes(identical))e.source_images.push(i+1);
+   warnings.push(`Source ${i+1} is an exact duplicate of source ${identical}; compare it in the source panel.`);continue;
+  }
   const valid=result?.status==='ready'&&w&&Array.isArray(w.days)&&w.days.length>0&&w.days.every(d=>d&&Array.isArray(d.exercises)&&d.exercises.length>0&&d.exercises.every(e=>e&&typeof e==='object'&&!Array.isArray(e)));
   if(!valid){
    failed.push(i+1);pages.push({page:i+1,status:'failed',message:label(result?.error).slice(0,1200)||'This source needs manual transcription or a retry.'});
@@ -18,8 +24,21 @@ export function mergeBulkWorkouts(results,{mode='same_workout',pageCount}={}){
   title ||= label(w.title);
   if(label(w.title))sourceTitles.push({page:i+1,title:label(w.title)});
   if(w.duration_days!=null)sourceDurations.push({page:i+1,value:structuredClone(w.duration_days)});
-  pages.push({page:i+1,status:'ready',exerciseCount:w.days.reduce((n,d)=>n+d.exercises.length,0),message:result.coverageStatus==='mismatch'?'This page extraction differs from its source counts. Correct it during review.':''});
-  for(const d of w.days)allDays.push({...structuredClone(d),exercises:d.exercises.map(e=>({...structuredClone(e),source_images:[i+1]}))});
+  pages.push({page:i+1,status:'ready',exerciseCount:w.days.reduce((n,d)=>n+d.exercises.length,0),message:result.coverageStatus==='mismatch'?'This page extraction differs from its source values/counts. Correct it during review.':result.coverageStatus==='unverified'?'Cropped or uncertain source: review every row and heading.':''});
+  for(const d of w.days){
+   const exercises=[];
+   for(const raw of d.exercises){
+    const e={...structuredClone(raw),source_images:[i+1]};
+    // Only a complete unnamed crop can match an earlier full named table.
+    // Two named cards are never merged by their numbers. Ambiguity stays visible.
+    if(resolveTableOverlaps&&mode==='same_workout'&&e.ocr_unlabelled===true&&!label(e.name)&&e.ocr_rows_complete===true&&e.set_details?.length){
+     const matches=allDays.flatMap(d=>d.exercises).filter(p=>label(p.name)&&p.ocr_rows_complete===true&&JSON.stringify(p.set_details)===JSON.stringify(e.set_details));
+     if(matches.length===1){matches[0].source_images.push(i+1);resolvedOverlaps.push({page:i+1,exercise:matches[0].name,matchedPages:[...matches[0].source_images].filter(p=>p!==i+1),sets:e.set_details.length});continue;}
+    }
+    exercises.push(e);
+   }
+   if(exercises.length)allDays.push({...structuredClone(d),exercises});
+  }
  }
  const explicit=new Set(allDays.map(d=>d.day!=null?'weekday:'+d.day:label(d.source_day_label)?'label:'+label(d.source_day_label).toLowerCase():'').filter(Boolean));
  // Conflicting explicit source labels are retained, even in same-workout mode.
@@ -31,10 +50,11 @@ export function mergeBulkWorkouts(results,{mode='same_workout',pageCount}={}){
  const repeatedExercises=[...occurrences.entries()].filter(([,xs])=>xs.length>1).map(([name,occurrences])=>({name,occurrences}));
  if(repeatedExercises.length)warnings.push('Repeated exercise names may be screenshot overlaps or intentional repeats. All entries and rows were retained; resolve them against every original source.');
  if(failed.length)warnings.push('Sources '+failed.join(', ')+' were not extracted. Their empty exercise placeholders must be filled or explicitly resolved during review.');
+ for(const match of resolvedOverlaps)warnings.push(`Source ${match.page}: unnamed cropped rows exactly match the full ${match.sets}-set table for "${match.exercise}" from source ${match.matchedPages.join(', ')}. Included once; confirm this overlap against the image.`);
  const durationValues=new Set(sourceDurations.map(d=>JSON.stringify(d.value)));
  const duration=durationValues.size===1?sourceDurations[0].value:null;
  if(durationValues.size>1)warnings.push('Source durations conflict: '+sourceDurations.map(d=>'source '+d.page+' = '+JSON.stringify(d.value).slice(0,100)).join('; ')+'. Confirm the correct program duration manually.');
  if(mode==='same_workout'&&new Set(sourceTitles.map(t=>t.title.toLowerCase())).size>1)warnings.push('Source titles differ. Confirm that these screenshots belong to the same workout and choose its full title.');
  warnings.push('Confirm combined source set counts manually. Per-image OCR counts are not added because screenshots may overlap.');
- return {review:{title,duration_days:duration,days},batchReview:{mode,pageCount,pages,failedPages:failed,repeatedExercises,sourceDurations,sourceTitles,warnings}};
+ return {review:{title,duration_days:duration,days},batchReview:{mode,pageCount,pages,failedPages:failed,repeatedExercises,resolvedOverlaps,sourceDurations,sourceTitles,warnings}};
 }
