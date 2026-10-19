@@ -35,6 +35,12 @@ export async function inspectSource({images,text}){
  const key=digest({images:images.map(i=>createHash('sha256').update(i.jpeg).digest('hex')),text}),prior=cache.get(key);
  if(prior&&Date.now()-prior.at<15*60*1000)return structuredClone(prior.value);
  if(!images.length)return countSourceTables(text);
+ if(images.length>1||text.trim()){
+  const pages=[];
+  for(const image of images)pages.push(await inspectSource({images:[image],text:''}));
+  if(text.trim())pages.push(countSourceTables(text));
+  return {status:'unverified',method:'ocr-table-count',tables:[],pageCounts:pages.map(p=>p.tables.map(t=>t.sets)),pageInventories:pages,message:'Multiple sources may overlap. Check all sources and enter the combined exercise/set counts without duplicates.'};
+ }
  if(busy)throw new ImportError('ocr_busy','Source counting is busy. Retry shortly; nothing was saved.',409);
  busy=true;let worker,timer,expired=false;
  try{
@@ -48,8 +54,6 @@ export async function inspectSource({images,text}){
     const bounded=await sharp(image.jpeg).resize(2200,2200,{fit:'inside',withoutEnlargement:true}).png().toBuffer();
     const {data}=await worker.recognize(bounded);pages.push(countSourceTables(data.text));
    }
-   // Screenshots may overlap. Never sum them and claim a verified total.
-   if(images.length!==1||text.trim())return {status:'unverified',method:'ocr-table-count',tables:[],pageCounts:pages.map(p=>p.tables.map(t=>t.sets)),message:'Multiple sources may overlap. Check all sources and enter the combined exercise/set counts without duplicates.'};
    return pages[0];
   })();
   const value=await Promise.race([run,timeout]);

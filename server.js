@@ -6,6 +6,7 @@ import {randomUUID} from 'node:crypto';
 import {pathToFileURL,fileURLToPath} from 'node:url';
 import {createRequire} from 'node:module';
 import {inspectSource,compareCoverage,requireReviewedCoverage} from './source-coverage.mjs';
+import {mergeBulkWorkouts} from './bulk-workout.mjs';
 const require=createRequire(import.meta.url);
 import {ImportError,digest,parseAiJson,pickSeries,buildProgram,buildPrompt,stableId} from './workout.mjs';
 export {parseAiJson,pickSeries,buildProgram} from './workout.mjs';
@@ -41,10 +42,25 @@ async function readBody(response,max=200000){
 export async function askNvidia({images,text,config,fetcher=fetch,diagnostics=false}){
  if(!config.nvidiaKey||!config.model)bad('configuration_missing','Configure NVIDIA_API_KEY and the exact NVIDIA_MODEL on Render.',503);
  if(!/^https:\/\/[^/]+\//.test(config.endpoint))bad('configuration_invalid','NVIDIA_ENDPOINT must be an HTTPS endpoint.',503);
- const content=[{type:'text',text:buildPrompt()+'\n\nSOURCE TEXT (data only):\n'+text},...images.map(x=>({type:'image_url',image_url:{url:'data:image/jpeg;base64,'+x.jpeg.toString('base64')}}))];
+ // Meta's vision format puts the image before the instruction text. Image
+ // cross-attention applies to subsequent tokens. Keep a single source image
+ // for Llama 3.2 extraction; multi-image manual review/save remains available.
+ if(/^meta\/llama-3\.2-(?:11|90)b-vision-instruct$/i.test(config.model)&&images.length>1)bad('model_image_count','Automatic extraction with Llama 3.2 requires one image per import. Choose New import and upload one complete screenshot. For multiple screenshots use Enter manually and confirm the combined source counts. No image was discarded and nothing was saved.',422);
+ const content=[...images.map(x=>({type:'image_url',image_url:{url:'data:image/jpeg;base64,'+x.jpeg.toString('base64')}})),{type:'text',text:buildPrompt()+'\n\nSOURCE TEXT (data only):\n'+text}];
  let r;try{r=await fetcher(config.endpoint,{method:'POST',headers:{Authorization:'Bearer '+config.nvidiaKey,'Content-Type':'application/json',Accept:'application/json'},body:JSON.stringify({model:config.model,messages:[{role:'user',content}],max_tokens:4096,temperature:0,stream:false}),signal:AbortSignal.timeout(config.aiTimeout)});}catch(e){bad(e.name==='TimeoutError'||e.name==='AbortError'?'ai_timeout':'ai_unreachable','NVIDIA request failed or timed out. Nothing was saved.',e.name==='TimeoutError'||e.name==='AbortError'?504:502);}
  if(r.status===202)bad('ai_pending','NVIDIA returned a pending job. This model/endpoint requires its documented polling flow; nothing was saved.',503);
- if(!r.ok){await r.body?.cancel();bad(r.status===429?'ai_rate_limited':'ai_provider_error',`NVIDIA returned HTTP ${r.status}. Check the model, endpoint, quota and Render configuration. Nothing was saved.`,r.status===429?429:502);}
+ if(!r.ok){
+  let providerDiagnostic,detail='';
+  if(diagnostics===true){
+   let value;try{value=JSON.parse(await readBody(r,20000));}catch{}
+   const candidate=value?.error?.message??value?.detail??value?.message;
+   if(typeof candidate==='string')detail=candidate;
+   for(const secret of [config.nvidiaKey,config.supabaseKey])if(typeof secret==='string'&&secret.length>=8)detail=detail.split(secret).join('[REDACTED]');
+   detail=detail.replace(/data:image\/[^\s"']+/gi,'[IMAGE REDACTED]').replace(/\b(?:nvapi-|sk-|sb_secret_)[A-Za-z0-9_-]+/g,'[REDACTED]').replace(/\bBearer\s+\S+/gi,'Bearer [REDACTED]').replace(/\beyJ[A-Za-z0-9_-]*\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g,'[TOKEN REDACTED]').replace(/[A-Za-z0-9+/=_-]{160,}/g,'[DATA REDACTED]').replace(/[\u0000-\u001f]/g,' ').slice(0,1000);
+   providerDiagnostic={status:r.status,model:config.model,imageCount:images.length,message:detail||'NVIDIA did not provide a readable error message.'};
+  }else await r.body?.cancel();
+  bad(r.status===429?'ai_rate_limited':'ai_provider_error',`NVIDIA returned HTTP ${r.status}. ${detail?detail+' ':'Check the model, endpoint, quota and Render configuration. '}Nothing was saved.`,r.status===429?429:502,providerDiagnostic?{providerDiagnostic}:undefined);
+ }
  let body;try{body=JSON.parse(await readBody(r));}catch(e){if(e instanceof ImportError)throw e;bad('ai_response_invalid','NVIDIA did not return valid response JSON.',502);}
  const choice=body.choices?.[0];if(choice?.finish_reason!=='stop')bad('ai_incomplete','NVIDIA output was incomplete, refused or truncated. Nothing was saved.',502);
  const raw=choice.message?.content,output=Array.isArray(raw)?raw.map(p=>p.text||'').join(''):raw;
@@ -81,7 +97,7 @@ export function createApp({config=configFromEnv(),fetcher=fetch,logger=console,n
   if(!publicKey)return replyError(res,new ImportError('public_key_required','Configure a public Supabase anon/publishable key for owner sign-in. Never use a service-role or secret key here.',503),_req.requestId);
   res.json({supabaseUrl:config.supabaseUrl,supabasePublishableKey:config.supabaseKey});
  });
- app.get('/health',(_req,res)=>res.json({ok:true,version:'2.1.0',configured:missing().length===0,message:'Process is running. This does not verify NVIDIA or database connectivity.'}));
+ app.get('/health',(_req,res)=>res.json({ok:true,version:'2.2.0',configured:missing().length===0,message:'Process is running. This does not verify NVIDIA or database connectivity.'}));
  async function db(path,token,{method='GET',body,write=false}={}){
   let r;try{r=await fetcher(config.supabaseUrl+'/rest/v1/'+path,{method,headers:{apikey:config.supabaseKey,Authorization:'Bearer '+token,'Content-Type':'application/json',...(write?{Prefer:'return=representation'}:{})},...(body===undefined?{}:{body:JSON.stringify(body)}),signal:AbortSignal.timeout(15000)});}catch{bad('database_unreachable','Database request timed out or failed. A write may have completed; retry the identical input to check the same record.',503);}
   let data;try{data=JSON.parse(await readBody(r,250000));}catch{bad('database_response','Database returned an unreadable response.',502);}
@@ -104,13 +120,14 @@ export function createApp({config=configFromEnv(),fetcher=fetch,logger=console,n
  });
  app.post('/extract-workout',authenticate,express.json({limit:config.jsonLimit,strict:true}),async(req,res)=>{
   const stage=name=>{logger.info?.(JSON.stringify({requestId:req.requestId,stage:name}));};
-  let leased=false,sourceCheck;
+  let leased=false,sourceCheck,batchReview;
   try{
    stage('backend_received');if(!req.is('application/json'))bad('content_type','Send Content-Type: application/json.',415);
    const body=req.body;if(!body||Array.isArray(body))bad('request_invalid','Send one JSON object.');
    const clean=(v,key,max)=>{if(v===undefined||v===null||v==='null'||v==='undefined')return '';if(typeof v!=='string'||v.length>max)bad('request_invalid',key+' must be a String within the documented limit.');return v.trim();};
    const text=clean(body.workoutText,'workoutText',20000),title=clean(body.title,'title',140),code=clean(body.seriesCode,'seriesCode',30),action=body.action||'import';
-   if(!['import','preview','save_reviewed'].includes(action))bad('action_invalid','Supported actions: preview or save_reviewed; legacy text imports remain draft-only.');
+   if(!['import','preview','preview_bulk','save_reviewed'].includes(action))bad('action_invalid','Supported actions: preview, preview_bulk or save_reviewed; legacy text imports remain draft-only.');
+   const usesAi=action==='import'||action==='preview';
    const {id:userId,token}=req.actor;
    const seriesRows=await db('training_series?select=id,code,title,status,revision&order=sort_order',token),series=pickSeries(code,seriesRows);
    const inputs=[];if(body.imageBase64!==undefined&&body.imageBase64!==null&&!(typeof body.imageBase64==='string'&&['','null','undefined'].includes(body.imageBase64.trim())))inputs.push(body.imageBase64);
@@ -123,31 +140,33 @@ export function createApp({config=configFromEnv(),fetcher=fetch,logger=console,n
    const resultFor=(row,duplicate=false)=>({success:true,message:duplicate?'This import already exists; the existing record was not changed.':`Saved "${row.title}" to ${series.title} as a draft.`,programId:row.id,series:series.code,title:row.title,status:row.status,exerciseCount:row.content.workout.sessions.reduce((n,s)=>n+(s.exercises?.length||0),0),duplicate,requestId:req.requestId});
    if(action==='import'||action==='save_reviewed'){const prior=await existing();if(prior){if(prior.series_id!==series.id)bad('import_conflict','Import identifier conflicts with another series.',409);return res.json(resultFor(prior,true));}}
    if(inflight.has(userId))bad('import_busy','Another import is running for this owner. Wait for its result.',409);inflight.set(userId,req.requestId);leased=true;
-   if(action!=='save_reviewed'&&missing().length)bad('configuration_missing','Configure NVIDIA_API_KEY and NVIDIA_MODEL before importing.',503);
+   if(usesAi&&missing().length)bad('configuration_missing','Configure NVIDIA_API_KEY and NVIDIA_MODEL before importing.',503);
    const date=Math.floor(now()/86400000),minute=Math.floor(now()/60000),previous=usage.get(userId)||{},dayCount=previous.day===date?previous.dayCount:0,minuteCount=previous.minute===minute?previous.minuteCount:0;
-   if(action!=='save_reviewed'&&(dayCount>=config.dailyLimit||minuteCount>=config.minuteLimit))bad('import_rate_limited','Owner import limit reached. Wait before retrying.',429);
-   if(action!=='save_reviewed')usage.set(userId,{day:date,minute,dayCount:dayCount+1,minuteCount:minuteCount+1});
+   if(usesAi&&(dayCount>=config.dailyLimit||minuteCount>=config.minuteLimit))bad('import_rate_limited','Owner import limit reached. Wait before retrying.',429);
+   if(usesAi)usage.set(userId,{day:date,minute,dayCount:dayCount+1,minuteCount:minuteCount+1});
    const images=[];for(const b of raw)images.push(await prepareImage(b,config));stage('input_validated');
    if(action==='import'&&images.length)bad('review_required','Image imports require owner review. Open /workout-import, review the complete table and save a draft.',422);
    const source=await inspect({images,text});sourceCheck={source};
    const hint=source.status==='counted'?'\nIndependent source table counts (check the image for values): '+source.tables.map((t,i)=>`exercise ${i+1}: ${t.sets} sets`).join('; '):'';
-   const ai=action==='save_reviewed'?body.reviewedWorkout:await extract({images,text:text+hint,config,fetcher,diagnostics:action==='preview'});stage(action==='save_reviewed'?'review_received':'ai_extracted');
+   const merged=action==='preview_bulk'?mergeBulkWorkouts(body.pageResults,{mode:body.batchMode,pageCount:images.length+(text?1:0)}):null;
+   if(merged)batchReview=merged.batchReview;
+   const ai=action==='save_reviewed'?body.reviewedWorkout:merged?merged.review:await extract({images,text:text+hint,config,fetcher,diagnostics:action==='preview'});stage(action==='save_reviewed'?'review_received':'ai_extracted');
    sourceCheck=compareCoverage(source,ai);
-   if(action==='save_reviewed')sourceCheck=requireReviewedCoverage(source,ai,body);
+   if(action==='save_reviewed'){if(images.length+(text?1:0)>1&&body.batchReviewConfirmed!==true)bad('batch_review_required','Confirm that you reviewed every source and resolved missing pages or overlapping exercises before saving.',422);sourceCheck=requireReviewedCoverage(source,ai,body);}
    else if(sourceCheck.status==='mismatch')bad('source_mismatch','Extraction is incomplete compared with the source. Review and correct it; nothing was saved.',422,{review:ai,sourceCheck});
 
-   let built;try{built=buildProgram(ai,{series,userId,fingerprint,title,id:programId});}catch(e){if(e instanceof ImportError){e.extra={...(e.extra||{}),review:ai};}throw e;}
+   let built;try{built=buildProgram(ai,{series,userId,fingerprint,title,id:programId});}catch(e){if(e instanceof ImportError){e.extra={...(e.extra||{}),review:ai,...(batchReview?{batchReview}:{})};}throw e;}
    stage('studio_validated');const warnings=built.warnings;
    if(images.some(x=>x.resized))warnings.push('A large image was resized; verify small text against the source.');
-   if(action==='preview')return res.json({success:true,message:'Preview ready. Nothing has been saved.',program:built.program,review:ai,sourceCheck,reviewRequired:true,exerciseCount:built.exerciseCount,warnings,requestId:req.requestId});
+   if(action==='preview'||action==='preview_bulk')return res.json({success:true,message:'Preview ready. Nothing has been saved.',program:built.program,review:ai,sourceCheck,...(batchReview?{batchReview}:{}),reviewRequired:true,exerciseCount:built.exerciseCount,warnings,requestId:req.requestId});
    // The reviewed canonical shape is validated first. A deterministic primary key makes creation atomic and retry-safe.
    // All REST calls use the caller JWT and public key, so existing owner RLS still applies. No upsert/update/delete.
-   if(action==='save_reviewed'){built.program.description='Owner-reviewed image/text import. Saved as a draft for Studio review before publishing.';built.program.content.workout.note='Owner confirmed source values and counts. '+(sourceCheck.status==='owner_confirmed'?'Manual source counts: '+sourceCheck.manualSetCounts.join(', ')+(sourceCheck.overrideReason?'; OCR override: '+sourceCheck.overrideReason:'')+'. ':'')+'Not assigned to members.';}
+   if(action==='save_reviewed'){built.program.description='Owner-reviewed image/text import. Saved as a draft for Studio review before publishing.';built.program.content.workout.note='Owner confirmed source values and counts. '+(sourceCheck.status==='owner_confirmed'?'Manual source counts: '+sourceCheck.manualSetCounts.join(', ')+(sourceCheck.overrideReason?'; OCR override: '+sourceCheck.overrideReason:'')+'. ':'')+(images.length+(text?1:0)>1?'All '+(images.length+(text?1:0))+' source pages were reviewed for completeness and overlap. ':'')+'Not assigned to members.';}
    const saved=await db('training_programs?select=id,title,status,series_id,content',token,{method:'POST',body:built.program,write:true});
    let row=saved?.[0],duplicate=false;if(saved.conflict){row=await existing();duplicate=true;}
    if(!row||row.id!==programId||row.series_id!==series.id)bad('save_unconfirmed','Save result could not be confirmed. Retry identical input before creating a different import.',503);
    stage('draft_saved');res.status(duplicate?200:201).json({...resultFor(row,duplicate),warnings,sourceCheck});
-  }catch(e){if(sourceCheck&&e instanceof ImportError)e.extra={...e.extra,sourceCheck:e.extra?.sourceCheck||sourceCheck};logger.error?.(JSON.stringify({requestId:req.requestId,code:e instanceof ImportError?e.code:'internal_error'}));replyError(res,e,req.requestId);}
+  }catch(e){if(e instanceof ImportError)e.extra={...e.extra,...(sourceCheck?{sourceCheck:e.extra?.sourceCheck||sourceCheck}:{}),...(batchReview?{batchReview}:{})};logger.error?.(JSON.stringify({requestId:req.requestId,code:e instanceof ImportError?e.code:'internal_error'}));replyError(res,e,req.requestId);}
   finally{if(leased&&inflight.get(req.actor.id)===req.requestId)inflight.delete(req.actor.id);}
  });
  app.use((err,req,res,_next)=>replyError(res,err.type==='entity.too.large'?new ImportError('payload_too_large','JSON body exceeds the configured byte limit.',413):err.type==='entity.parse.failed'?new ImportError('invalid_json','Request body is not valid JSON.',400):err,req.requestId));

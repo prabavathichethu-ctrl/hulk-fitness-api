@@ -1,9 +1,9 @@
 'use strict';
 const $=id=>document.getElementById(id);
-const state={client:null,source:null,workout:null,sourceCheck:null,busy:false,saved:false,urls:[]};
+const state={client:null,source:null,workout:null,sourceCheck:null,busy:false,saved:false,urls:[],batch:null,dirty:false,selectedFiles:[]};
 const node=(tag,text,cls)=>{const n=document.createElement(tag);if(text!==undefined)n.textContent=text;if(cls)n.className=cls;return n;};
 function notice(message,error=false){$('notice').textContent=message;$('notice').className=error?'error':'';}
-function setBusy(on){state.busy=on;document.body.classList.toggle('busy',on);document.querySelectorAll('button,input,select,textarea').forEach(b=>b.disabled=on);if(!on){if(state.saved)lockReview();else updateGate();}}
+function setBusy(on){state.busy=on;document.body.classList.toggle('busy',on);document.querySelectorAll('button,input,select,textarea').forEach(b=>b.disabled=on);$('stop-batch').disabled=!on||!state.batch;if(!on){if(state.saved)lockReview();else updateGate();}}
 function button(text,fn,cls='quiet'){const b=node('button',text,cls);b.type='button';b.addEventListener('click',fn);return b;}
 function field(parent,label,value,change,{kind='text',options,max}={}){
  const l=node('label',label),input=node(kind==='select'?'select':kind==='textarea'?'textarea':'input');
@@ -30,25 +30,25 @@ async function api(path,body){
 async function ownerSession(){const {r,data}=await api('/import-session');if(!r.ok||!data.success)throw Error(data.error||'Owner access is required.');const previous=$('series').value;$('series').replaceChildren(node('option','Choose a series'));$('series').firstChild.value='';for(const s of data.series){const o=node('option',s.title);o.value=s.code;$('series').append(o);}$('series').value=previous;$('login').hidden=true;$('workspace').hidden=false;$('logout').hidden=false;}
 async function captureSource(){
  if(!$('series').value)throw Error('Choose the destination series first.');
- const files=[...$('files').files],text=$('source-text').value.trim();
+ const files=state.selectedFiles,text=$('source-text').value.trim();
  if(!files.length&&!text)throw Error('Choose a workout image or paste the complete workout.');
  if(files.length>4||files.some(f=>f.size>5*1024*1024)||files.reduce((n,f)=>n+f.size,0)>10*1024*1024)throw Error('Use up to 4 images, each under 5 MB and under 10 MB combined.');
  const images=[];for(const f of files){if(!['image/jpeg','image/png','image/webp'].includes(f.type))throw Error('Use JPG, PNG or WEBP images.');images.push(await new Promise((resolve,reject)=>{const reader=new FileReader();reader.onload=()=>resolve(reader.result.split(',')[1]);reader.onerror=()=>reject(Error('Image could not be read.'));reader.readAsDataURL(f);}));}
- return {seriesCode:$('series').value,workoutText:text,images};
+ return {seriesCode:$('series').value,workoutText:text,images,batchMode:$('batch-mode').value};
 }
 function displaySources(){
  state.urls.forEach(u=>URL.revokeObjectURL(u));state.urls=[];$('sources').replaceChildren();
- for(const [i,b64]of state.source.images.entries()){const bytes=Uint8Array.from(atob(b64),c=>c.charCodeAt(0)),url=URL.createObjectURL(new Blob([bytes]));state.urls.push(url);const img=node('img');img.src=url;img.alt='Original workout screenshot '+(i+1);$('sources').append(img);}
+ for(const [i,b64]of state.source.images.entries()){const bytes=Uint8Array.from(atob(b64),c=>c.charCodeAt(0)),url=URL.createObjectURL(new Blob([bytes]));state.urls.push(url);$('sources').append(node('h4','Image '+(i+1)));const img=node('img');img.src=url;img.alt='Original workout screenshot '+(i+1);$('sources').append(img);}
  if(state.source.workoutText)$('sources').append(node('pre',state.source.workoutText));
  $('destination').textContent='Destination: '+$('series').selectedOptions[0].textContent;
 }
-function openReview(workout,sourceCheck){
- state.workout=normalize(workout);state.sourceCheck=sourceCheck;state.saved=false;
- $('source-form').hidden=true;$('review').hidden=false;$('confirmed').checked=false;$('source-counts').value='';$('override-reason').value='';
+function openReview(workout,sourceCheck,batchReview=null){
+ state.workout=normalize(workout);state.sourceCheck=sourceCheck;state.saved=false;state.dirty=false;
+ $('source-form').hidden=true;$('review').hidden=false;$('confirmed').checked=false;$('batch-confirmed').checked=false;$('source-counts').value='';$('override-reason').value='';
  $('workout-title').value=state.workout.title??'';$('duration').value=state.workout.duration_days??'';
- displaySources();renderSessions();updateGate();
+ displaySources();renderSessions();renderBatchSummary(batchReview);updateGate();
 }
-function edited(){if(!state.workout)return;$('confirmed').checked=false;notice('Compare your corrections with the original source, then confirm the complete review. Nothing has been saved.');updateGate();}
+function edited(){if(!state.workout)return;$('confirmed').checked=false;$('batch-confirmed').checked=false;state.dirty=true;notice('Compare your corrections with the original source, then confirm the complete review. Nothing has been saved.');updateGate();}
 function renderSessions(){
  $('sessions').replaceChildren();
  state.workout.days.forEach((d,di)=>{
@@ -58,7 +58,7 @@ function renderSessions(){
   field(fields,'Weekday (only if specified)',d.day==null?'':String(d.day),v=>d.day=v===''?null:Number(v),{kind:'select',options:[['','Unspecified'],...['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday'].map((s,i)=>[String(i),s])]});
   field(fields,'Source day/session label (if present)',d.source_day_label,v=>d.source_day_label=v||null,{max:100});section.append(fields);
   d.exercises.forEach((e,ei)=>{
-   const card=node('article',undefined,'exercise'),bar=node('div',undefined,'actions');bar.append(node('h4','Exercise '+(ei+1)),button('Remove exercise',()=>{d.exercises.splice(ei,1);renderSessions();edited();},'quiet danger'));card.append(bar);
+   const card=node('article',undefined,'exercise'),bar=node('div',undefined,'actions');bar.append(node('h4','Exercise '+(ei+1)),button('Remove exercise',()=>{d.exercises.splice(ei,1);renderSessions();edited();},'quiet danger'));card.append(bar);if(Array.isArray(e.source_images))card.append(node('p','Source: image/page '+e.source_images.join(', '),'hint'));
    field(card,'Exercise name',e.name,v=>e.name=v,{max:120});
    const ef=node('div',undefined,'fields');
    field(ef,'Equipment',e.equipment||'',v=>e.equipment=v,{kind:'select',options:[['','Choose equipment'],['gym','Gym'],['dumbbell','Dumbbell'],['band','Band'],['bodyweight','Bodyweight']]});
@@ -101,24 +101,64 @@ function updateGate(){
  if(ok)box.classList.add('ok');const issues=coverageIssues();if(issues.length){const ul=node('ul');issues.forEach(t=>ul.append(node('li',t)));box.append(ul);}$('coverage').replaceChildren(box);
  $('override-label').hidden=src?.status!=='counted';if(src?.status!=='counted')$('manual-count-panel').open=true;
  const validation=localIssues();$('validation').textContent=validation.slice(0,4).join(' ');
- $('save').disabled=state.busy||state.saved||!ok||validation.length>0||!$('confirmed').checked;
+ $('save').disabled=state.busy||state.saved||!ok||validation.length>0||!$('confirmed').checked||(! $('batch-confirm-label').hidden&&!$('batch-confirmed').checked);
  $('save-note').textContent=state.saved?'Draft saved. Further edits belong in Studio.':'Nothing has been saved. Check the source before confirming.';
 }
-function lockReview(){document.querySelectorAll('#review input,#review select,#review textarea,#review button').forEach(n=>n.disabled=true);$('reset').disabled=false;}
-function reset(){state.urls.forEach(u=>URL.revokeObjectURL(u));state.urls=[];state.source=null;state.workout=null;state.sourceCheck=null;state.saved=false;$('review').hidden=true;$('source-form').hidden=false;$('files').value='';$('source-text').value='';document.querySelectorAll('#review input,#review select,#review textarea,#review button').forEach(n=>n.disabled=false);notice('Choose the next source.');}
+function renderBatchSummary(batch){
+ const count=state.source.images.length+(state.source.workoutText?1:0);$('batch-confirm-label').hidden=count<2;$('batch-summary').replaceChildren();
+ if(!batch)return;const box=node('div',undefined,'status');box.append(node('strong','All source pages need review'));const list=node('ul');
+ for(const page of batch.pages){list.append(node('li','Source '+page.page+': '+(page.status==='ready'?page.exerciseCount+' exercises extracted. '+(page.message||''):'Extraction failed. '+page.message)));}
+ for(const message of batch.warnings)list.append(node('li',message));box.append(list);$('batch-summary').append(box);
+}
+function paintBatch(){
+ $('batch-progress').hidden=false;$('page-progress').replaceChildren();
+ state.batch.results.forEach((r,i)=>$('page-progress').append(node('li','Source '+(i+1)+' of '+state.batch.results.length+' · '+r.status+(r.reusedFrom?' (result reused from identical source '+r.reusedFrom+')':'')+(r.error?' — '+r.error:''))));
+ $('retry-batch').hidden=state.busy;const failures=state.batch.results.filter(r=>r.status!=='ready').length;$('retry-batch').textContent=failures?'Retry failed sources ('+failures+')':'Rebuild review (no AI calls)';
+}
+async function runBulk(){
+ if(!state.batch){const sources=state.source.images.map(image=>({images:[image],workoutText:''}));if(state.source.workoutText)sources.push({images:[],workoutText:state.source.workoutText});state.batch={sources,results:sources.map(()=>({status:'pending'})),stop:false};$('source-form').hidden=true;}
+ state.batch.stop=false;$('stop-batch').disabled=false;paintBatch();
+ for(let i=0;i<state.batch.sources.length;i++){
+  if(state.batch.results[i].status==='ready')continue;
+  if(state.batch.stop){state.batch.results[i]={status:'failed',error:'Not requested: batch was stopped. Retry this source or transcribe it manually.'};continue;}
+  const source=state.batch.sources[i];state.batch.results[i]={status:'processing'};paintBatch();notice('Extracting source '+(i+1)+' of '+state.batch.sources.length+'… Completed sources will not be requested again on retry.');
+  // Reuse an identical screenshot's result, but keep both entries in review so
+  // intentional repeats versus overlaps are an explicit owner decision.
+  const prior=source.images.length?state.batch.sources.findIndex((s,j)=>j<i&&s.images[0]===source.images[0]&&state.batch.results[j].status==='ready'):-1;
+  if(prior>=0){state.batch.results[i]=structuredClone(state.batch.results[prior]);state.batch.results[i].reusedFrom=prior+1;paintBatch();continue;}
+  try{const {r,data}=await api('/extract-workout',{seriesCode:state.source.seriesCode,...source,action:'preview'});
+   if(data.review&&Array.isArray(data.review.days)&&data.review.days.length&&data.review.days.every(d=>Array.isArray(d?.exercises)&&d.exercises.length))state.batch.results[i]={status:'ready',review:data.review,coverageStatus:data.sourceCheck?.status};
+   else state.batch.results[i]={status:'failed',error:data.error||'No usable extraction returned. Retry or enter this source manually.'};
+   if(r.status===429)state.batch.stop=true;
+  }catch(e){state.batch.results[i]={status:'failed',error:e.message||'Source request failed.'};if(!$('login').hidden)state.batch.stop=true;}
+  paintBatch();
+ }
+ const {r,data}=await api('/extract-workout',{...state.source,action:'preview_bulk',pageResults:state.batch.results});
+ if(data.review){openReview(data.review,data.sourceCheck,data.batchReview);notice('Bulk extraction is ready for review. Check every source and resolve missing or repeated entries. Nothing has been saved.',!r.ok);}else throw Error(data.error||'The review could not be built. Retry the review without requesting completed sources again.');
+}
+$('discard-batch').addEventListener('click',reset);
+$('stop-batch').addEventListener('click',()=>{if(state.batch){state.batch.stop=true;$('stop-batch').disabled=true;notice('The current source will finish. Remaining sources will be left for retry or manual entry.');}});
+$('retry-batch').addEventListener('click',async()=>{if(state.busy||!state.batch||state.saved)return;if(state.dirty&&!window.confirm('Retrying rebuilds the review table and replaces your unsaved corrections. Continue?'))return;setBusy(true);try{await runBulk();}catch(e){notice(e.message,true);}finally{setBusy(false);paintBatch();}});
+function lockReview(){$('retry-batch').disabled=true;document.querySelectorAll('#review input,#review select,#review textarea,#review button').forEach(n=>n.disabled=true);$('reset').disabled=false;}
+function reset(){state.urls.forEach(u=>URL.revokeObjectURL(u));state.urls=[];state.source=null;state.workout=null;state.sourceCheck=null;state.saved=false;state.batch=null;state.dirty=false;$('batch-progress').hidden=true;$('review').hidden=true;$('source-form').hidden=false;$('files').value='';state.selectedFiles=[];$('selected-files').replaceChildren();$('source-text').value='';document.querySelectorAll('#review input,#review select,#review textarea,#review button').forEach(n=>n.disabled=false);notice('Choose the next source.');}
 async function begin(manual=false){if(state.busy)return;setBusy(true);notice(manual?'Preparing manual review…':'Counting the source and extracting the workout… This can take up to two minutes.');try{
- state.source=await captureSource();
+ state.source=await captureSource();state.batch=null;
  if(manual){openReview(emptyWorkout(),null);notice('Enter every exercise and set, then confirm the source counts.');return;}
+ if(state.source.images.length+(state.source.workoutText?1:0)>1){await runBulk();return;}
  const {r,data}=await api('/extract-workout',{...state.source,action:'preview'});
  if(data.review){openReview(data.review,data.sourceCheck);notice(r.ok?'Extraction ready. Compare the complete table with the source.':data.error,true);}
  else{openReview(emptyWorkout(),data.sourceCheck);notice((data.error||'Extraction could not be read.')+' You can enter the workout manually or start a new import.',true);}
- }catch(e){notice(e.message||'Request failed. Retry shortly.',true);}finally{setBusy(false);}}
+ }catch(e){notice(e.message||'Request failed. Retry shortly.',true);}finally{setBusy(false);if(state.batch)paintBatch();}}
 $('login-form').addEventListener('submit',async event=>{event.preventDefault();if(state.busy)return;setBusy(true);try{const identity=$('identity').value.trim(),password=$('password').value;const {error}=await state.client.auth.signInWithPassword({...identity.startsWith('+')?{phone:identity}:{email:identity},password});$('password').value='';if(error)throw Error(error.message);await ownerSession();notice('Choose the series and complete workout source.');}catch(e){$('password').value='';notice(e.message,true);}finally{setBusy(false);}});
+function showSelectedFiles(){
+ $('selected-files').replaceChildren();state.selectedFiles.forEach((file,i)=>{const row=node('li');row.append(node('span',file.name+' '));if(i>0)row.append(button('Move up',()=>{[state.selectedFiles[i-1],state.selectedFiles[i]]=[state.selectedFiles[i],state.selectedFiles[i-1]];showSelectedFiles();}));if(i<state.selectedFiles.length-1)row.append(button('Move down',()=>{[state.selectedFiles[i+1],state.selectedFiles[i]]=[state.selectedFiles[i],state.selectedFiles[i+1]];showSelectedFiles();}));$('selected-files').append(row);});
+}
+$('files').addEventListener('change',()=>{state.selectedFiles=[...$('files').files];showSelectedFiles();});
 $('extract').addEventListener('click',()=>begin(false));$('manual').addEventListener('click',()=>begin(true));$('reset').addEventListener('click',reset);
 $('workout-title').addEventListener('input',()=>{state.workout.title=$('workout-title').value;edited();});$('duration').addEventListener('input',()=>{state.workout.duration_days=numeric($('duration').value);edited();});
-$('source-counts').addEventListener('input',edited);$('override-reason').addEventListener('input',edited);$('confirmed').addEventListener('change',updateGate);
+$('source-counts').addEventListener('input',edited);$('override-reason').addEventListener('input',edited);$('confirmed').addEventListener('change',updateGate);$('batch-confirmed').addEventListener('change',updateGate);
 $('add-session').addEventListener('click',()=>{state.workout.days.push({day:null,source_day_label:null,title:'',exercises:[]});renderSessions();edited();});
 $('merge').addEventListener('click',()=>{state.workout.days=[{day:null,source_day_label:null,title:state.workout.title,exercises:state.workout.days.flatMap(d=>d.exercises)}];renderSessions();edited();});
-$('save').addEventListener('click',async()=>{if(state.busy||$('save').disabled)return;setBusy(true);notice('Saving the reviewed values as a draft…');try{const {r,data}=await api('/extract-workout',{...state.source,action:'save_reviewed',reviewedWorkout:state.workout,reviewConfirmed:$('confirmed').checked,sourceSetCounts:countsInput(),sourceCountOverride:$('override-reason').value.trim()||undefined});if(!r.ok||!data.success){if(data.sourceCheck)state.sourceCheck=data.sourceCheck;throw Error(data.error||'Save could not be confirmed. Retry the same review.');}state.saved=true;notice(data.message+' Open the selected series in Studio to review and publish.');$('save-note').textContent='Draft ID: '+data.programId;lockReview();}catch(e){notice(e.message,true);}finally{setBusy(false);}});
+$('save').addEventListener('click',async()=>{if(state.busy||$('save').disabled)return;setBusy(true);notice('Saving the reviewed values as a draft…');try{const {r,data}=await api('/extract-workout',{...state.source,action:'save_reviewed',reviewedWorkout:state.workout,reviewConfirmed:$('confirmed').checked,sourceSetCounts:countsInput(),batchReviewConfirmed:$('batch-confirmed').checked,sourceCountOverride:$('override-reason').value.trim()||undefined});if(!r.ok||!data.success){if(data.sourceCheck)state.sourceCheck=data.sourceCheck;throw Error(data.error||'Save could not be confirmed. Retry the same review.');}state.saved=true;notice(data.message+' Open the selected series in Studio to review and publish.');$('save-note').textContent='Draft ID: '+data.programId;lockReview();}catch(e){notice(e.message,true);}finally{setBusy(false);}});
 $('logout').addEventListener('click',async()=>{if(state.busy)return;await state.client.auth.signOut({scope:'local'});reset();$('workspace').hidden=true;$('login').hidden=false;$('logout').hidden=true;notice('Signed out.');});
 (async()=>{try{const r=await fetch('/import-config');const c=await r.json();if(!r.ok||!c.supabaseUrl||!c.supabasePublishableKey)throw Error('The owner sign-in configuration is unavailable. Check Render configuration.');state.client=supabase.createClient(c.supabaseUrl,c.supabasePublishableKey,{auth:{persistSession:false,autoRefreshToken:true,detectSessionInUrl:false}});notice('Sign in to start. Your review stays on this page until you save or leave.');}catch(e){notice(e.message,true);$('login-form').querySelector('button').disabled=true;}})();
