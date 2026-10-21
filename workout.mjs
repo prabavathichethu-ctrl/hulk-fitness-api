@@ -63,8 +63,9 @@ export function buildProgram(ai,{series,userId,fingerprint,title='',id}){
    if(ex.each_side!==null&&ex.each_side!==undefined&&typeof ex.each_side!=='boolean')error('needs_review',label+': each_side must be true, false or null.');
    if(ex.each_side==null)warnings.push(label+': Each side was not specified; the flag remains off pending coach review.');
    if(set_details.some(s=>s.rest_seconds===null))warnings.push(label+': unspecified rest stays blank; confirm it before member assignment.');
-   const tempo=ex.tempo==null?'':text(ex.tempo,label+' tempo',60);if(tempo)definition.cues.en.push('Source tempo: '+tempo);
-   if(definition.cues.en.length>6)error('needs_review',label+': source notes plus tempo exceed six lines; review before saving.');
+   const tempo=ex.tempo==null?'':text(ex.tempo,label+' tempo',60);if(tempo)definition.cues.en.push((ex.coach_defaults?.tempo===tempo?'Coach default tempo: ':'Tempo: ')+tempo);
+   if(ex.coach_defaults?.reps_in_reserve!=null&&ex.coach_defaults.reps_in_reserve===ex.reps_in_reserve)definition.cues.en.push('Coach default RIR: '+ex.reps_in_reserve);
+   if(definition.cues.en.length>6)error('needs_review',label+': source/coaching notes and tempo/RIR labels exceed six lines; review before saving.');
    const e={id:'custom_'+stableId(`${userId}:${series.id}:${fingerprint}:${day}:${j}`),custom:definition,set_details,load_each_side:ex.each_side===true,reps_in_reserve:optionalNumber(ex.reps_in_reserve,1,4,true,label+' RIR')};syncSetSummary(e);count++;return e;
   });
   sessions[day]={day,kind:'strength',title:text(d.title||name,'Session title',100,true),exercises};
@@ -88,3 +89,4 @@ Rules:
 - Equipment IDs: ${EQUIPMENT.join(', ')}. Muscle IDs: ${MUSCLE_IDS.join(', ')}. Muscle arrays start empty. Populate a muscle role only when the source explicitly identifies it and it maps unambiguously to an allowed ID; otherwise keep []. Never copy a muscle tag from a schema example or infer extra primary/secondary/stabiliser roles from an exercise name. Keep the three muscle groups disjoint. Do not generate extra form advice; cues contain source notes only.
 - Explicit Monday..Sunday maps to day 0..6; otherwise day=null. No invented weekly schedule. duration_days is null unless explicitly stated.
 - If title is missing use an empty string for owner review. Do not silently remove content beyond any app limit. Never return SQL, HTML, IDs or database actions.`;}
+

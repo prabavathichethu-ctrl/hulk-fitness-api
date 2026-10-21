@@ -2,7 +2,8 @@
 // Base names/transliterations/cues: existing studio/exercise-catalog.mjs.
 // Base muscle roles: existing HULK muscle-mapping.json. Three explicit row variants
 // use broad movement regions; emphasis still requires the coach's review.
-export const COACHING_VERSION='hulk-import-coaching-1.0.0';
+// Additional back/biceps entries and their references: COACHING_AUTOFILL.md.
+export const COACHING_VERSION='hulk-import-coaching-1.1.0';
 export const COACHING_PROFILES=[
  {
   "id": "leg_press",
@@ -609,6 +610,28 @@ export const COACHING_PROFILES=[
    "V Bar Seated Cable Row",
    "Seated V Bar Cable Row"
   ]
+ },{
+  id:'cable_face_pull',name:'Cable Face Pull',name_kn:'ಕೇಬಲ್ ಫೇಸ್ ಪುಲ್',equipment:'gym',
+  primary:['rear_delts','upper_back'],secondary:['rotator_cuff','biceps'],stabilisers:['core'],
+  cues:['Pull the rope toward your face with control.','Keep the trunk steady and avoid shrugging or jerking the load.'],
+  aliases:['Cable Face Pull','Cable Face Pulls','Face Pull','Face Pulls']
+ },{
+  id:'db_deadlift',name:'Dumbbell Deadlift',name_kn:'ಡಂಬೆಲ್ ಡೆಡ್‌ಲಿಫ್ಟ್',equipment:'dumbbell',
+  // The source does not identify conventional, Romanian or stiff-leg form.
+  // Fill the name without substituting a variation or guessing muscle roles.
+  primary:[],secondary:[],stabilisers:[],
+  cues:['Confirm the intended dumbbell deadlift variation with the coach.','Select the muscle roles for that variation before publishing.'],
+  aliases:['Dumbbell Deadlift','Dumbbell Deadlifts']
+ },{
+  id:'barbell_bicep_curl',name:'Barbell Bicep Curl',name_kn:'ಬಾರ್‌ಬೆಲ್ ಬೈಸೆಪ್ ಕರ್ಲ್',equipment:'gym',
+  primary:['biceps'],secondary:['forearms'],stabilisers:[],
+  cues:['Keep the upper arms near the torso while curling.','Lift and lower with control without swinging the trunk.'],
+  aliases:['Barbell Bicep Curl','Barbell Biceps Curl','Barbell Curl']
+ },{
+  id:'db_hammer_curl',name:'Dumbbell Hammer Curl',name_kn:'ಡಂಬೆಲ್ ಹ್ಯಾಮರ್ ಕರ್ಲ್',equipment:'dumbbell',
+  primary:['biceps'],secondary:['forearms'],stabilisers:[],
+  cues:['Keep a neutral grip with palms facing inward.','Keep the upper arms steady and lower the dumbbells with control.'],
+  aliases:['Dumbbell Hammer Curl','Dumbbell Hammer Curls','Hammer Curl','Hammer Curls']
  }
 ];
 const normal=value=>String(value||'').normalize('NFKC').toLowerCase().replace(/[^\p{L}\p{N}]+/gu,' ').trim().replace(/\s+/g,' ');
@@ -646,8 +669,31 @@ export function autofillCoaching(exercise){
 }
 export function coachingMatchesCurrent(exercise){return Boolean(exercise.coaching_autofill&&exercise.coaching_autofill.profileId===lookupCoaching(exercise.name,{ocr:exercise.ocr_rows_complete!==undefined})?.profile.id);}
 export function fillWorkoutCoaching(workout){let count=0;for(const day of workout?.days||[])for(const exercise of day.exercises||[])if(autofillCoaching(exercise).filled.length)count++;return count;}
+// Values come from the coach's explicit input, never from an exercise-name guess.
+// They only fill blank prescription fields and retain provenance for draft notes.
+export function applyCoachDefaults(workout,{tempo='',reps_in_reserve=null}={}){
+ const t=String(tempo??'').trim();
+ if(t.length>60)throw new RangeError('Tempo must be at most 60 characters.');
+ const r=reps_in_reserve==null||reps_in_reserve===''?null:Number(reps_in_reserve);
+ if(r!==null&&(!Number.isInteger(r)||r<1||r>4))throw new RangeError('Choose a whole RIR value from 1 to 4, or leave it blank.');
+ if(!t&&r===null)throw new RangeError('Enter a coach-selected tempo or RIR first.');
+ const result={exercisesUpdated:0,tempoFilled:0,rirFilled:0,skipped:0};
+ for(const day of workout?.days||[])for(const e of day.exercises||[]){
+  const fillTempo=Boolean(t)&&blank(e.tempo),fillRir=r!==null&&blank(e.reps_in_reserve);
+  if(!fillTempo&&!fillRir)continue;
+  const afterTempo=fillTempo?t:e.tempo,afterRir=fillRir?r:e.reps_in_reserve;
+  const defaults={...(e.coach_defaults||{}),...(fillTempo?{tempo:t}:{}),...(fillRir?{reps_in_reserve:r}:{})};
+  const noteCount=(Array.isArray(e.cues)?e.cues.length:0)+(afterTempo?1:0)+(defaults.reps_in_reserve!=null&&defaults.reps_in_reserve===afterRir?1:0);
+  if(noteCount>6){result.skipped++;continue;}
+  if(fillTempo){e.tempo=t;result.tempoFilled++;}
+  if(fillRir){e.reps_in_reserve=r;result.rirFilled++;}
+  e.coach_defaults=defaults;result.exercisesUpdated++;
+ }
+ return result;
+}
 export function clearCoachingAutofill(exercise){
  const meta=exercise.coaching_autofill,profile=COACHING_PROFILES.find(p=>p.id===meta?.profileId);
  if(profile)for(const key of Array.isArray(meta.fields)?meta.fields:[]){const value=key==='name_kn'?profile.name_kn:profile[key];if(JSON.stringify(exercise[key])===JSON.stringify(value))exercise[key]=Array.isArray(value)?[]:'';}
  delete exercise.coaching_autofill;
 }
+
